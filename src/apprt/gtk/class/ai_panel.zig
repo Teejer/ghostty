@@ -19,6 +19,21 @@ extern fn read(fd: c_int, buf: [*]align(1) u8, count: usize) callconv(.c) isize;
 extern fn write(fd: c_int, buf: [*]align(1) const u8, count: usize) callconv(.c) isize;
 extern fn close(fd: c_int) callconv(.c) c_int;
 extern fn fcntl(fd: c_int, cmd: c_int, ...) callconv(.c) c_int;
+const Tm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long,
+    zone: ?[*:0]const u8,
+};
+extern fn localtime(timer: *const i64) callconv(.c) ?*Tm;
+extern fn time(arg: ?*anyopaque) callconv(.c) i64;
 const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
@@ -124,6 +139,11 @@ pub const AiPanel = extern struct {
         exec_deny_btn: ?*gtk.Button = null,
         exec_active: bool = false,
         exec_interactive: bool = false,
+
+        /// Shown once when a slow command passes the soft timeout;
+        /// the reply is then held until the screen settles or the
+        /// hard timeout (3 min) passes.
+        exec_waiting: bool = false,
         exec_before: ?[]u8 = null,
         exec_last: ?[]u8 = null,
         exec_elapsed_ms: u32 = 0,
@@ -423,7 +443,17 @@ pub const AiPanel = extern struct {
             self.closeThinkingBlock();
             if (!priv.ai_turn_open) {
                 priv.ai_turn_open = true;
-                self.appendText("\nai: ");
+                if (stamp()) |hm| {
+                    defer alloc().free(hm);
+                    const prefix = std.fmt.allocPrintSentinel(
+                        alloc(),
+                        "\nai · {s}: ",
+                        .{hm},
+                        0,
+                    ) catch return;
+                    defer alloc().free(prefix);
+                    self.appendText(prefix);
+                } else self.appendText("\nai: ");
             }
             self.appendSlice(msg.text orelse "");
         } else if (std.mem.eql(u8, msg.type, "done")) {
@@ -447,7 +477,7 @@ pub const AiPanel = extern struct {
             if (msg.auto orelse false) {
                 const auto_note = std.fmt.allocPrintSentinel(
                     alloc(),
-                    "exec: auto-running: {s}",
+                    "auto-run: {s}",
                     .{cmd},
                     0,
                 ) catch return;
@@ -459,7 +489,7 @@ pub const AiPanel = extern struct {
                 self.private().ai_turn_open = false;
                 const ask = std.fmt.allocPrintSentinel(
                     alloc(),
-                    "The AI wants to run this in your tab:\n{s}",
+                    "Run: {s}",
                     .{cmd},
                     0,
                 ) catch return;
@@ -595,7 +625,7 @@ pub const AiPanel = extern struct {
         buffer.getEndIter(&iter);
         const anchor = buffer.createChildAnchor(&iter);
 
-        const button = gtk.Button.newWithLabel("▸ thinking");
+        const button = gtk.Button.newWithLabel("thinking ▸");
         button.as(gtk.Widget).addCssClass("flat");
         button.as(gtk.Widget).addCssClass("caption");
         _ = gtk.Button.signals.clicked.connect(
@@ -653,7 +683,11 @@ pub const AiPanel = extern struct {
         const buffer = priv.transcript.getBuffer();
         var e: gtk.TextIter = undefined;
         buffer.getEndIter(&e);
-        blk.end = buffer.createMark(null, &e, 0);
+        // Left gravity, like the start mark: a right-gravity mark at
+        // the buffer end slides right with every later insertion, so
+        // collapsing would hide everything appended since (including
+        // the exec Run/Deny anchors).
+        blk.end = buffer.createMark(null, &e, 1);
     }
 
     fn onThinkingToggled(
@@ -673,11 +707,11 @@ pub const AiPanel = extern struct {
             if (blk.hidden) {
                 buffer.removeTag(priv.tag_hidden.?, &s, &e);
                 blk.hidden = false;
-                button.setLabel("▾ thinking");
+                button.setLabel("thinking ▾");
             } else {
                 buffer.applyTag(priv.tag_hidden.?, &s, &e);
                 blk.hidden = true;
-                button.setLabel("▸ thinking");
+                button.setLabel("thinking ▸");
             }
             return;
         }
@@ -704,6 +738,7 @@ pub const AiPanel = extern struct {
         self.append("\n", null);
 
         const box = gtk.Box.new(.horizontal, 6);
+        box.as(gtk.Widget).addCssClass("ai-exec");
         const run = gtk.Button.newWithLabel("Run");
         run.as(gtk.Widget).addCssClass("suggested-action");
         const deny = gtk.Button.newWithLabel("Deny");
@@ -822,6 +857,7 @@ pub const AiPanel = extern struct {
 
         priv.exec_active = true;
         priv.exec_interactive = isInteractiveCommand(cmd);
+        priv.exec_waiting = false;
         priv.exec_elapsed_ms = 0;
         priv.exec_stable_ms = 0;
         priv.exec_tick = 0;
@@ -862,13 +898,21 @@ pub const AiPanel = extern struct {
             }
             const settle_ms: u32 = if (priv.exec_interactive) 700 else 900;
             const timeout_ms: u32 = if (priv.exec_interactive) 4_000 else 30_000;
-            if (priv.exec_stable_ms >= settle_ms) {
+            const min_age_ms: u32 = if (priv.exec_interactive) 1_500 else 2_000;
+            if (priv.exec_stable_ms >= settle_ms and priv.exec_elapsed_ms >= min_age_ms) {
                 self.finishExec("done", after);
-            } else if (priv.exec_elapsed_ms >= timeout_ms) {
-                self.finishExec(
-                    if (priv.exec_interactive) "interactive" else "timeout",
-                    after,
-                );
+            } else if (priv.exec_interactive) {
+                if (priv.exec_elapsed_ms >= timeout_ms)
+                    self.finishExec("interactive", after);
+            } else if (priv.exec_elapsed_ms >= 180_000) {
+                // Hard cap: still answer with what we have.
+                self.finishExec("timeout", after);
+            } else if (priv.exec_elapsed_ms >= timeout_ms and !priv.exec_waiting) {
+                // Soft timeout: keep watching and say so in the
+                // panel. The model only ever sees the settled screen,
+                // so it never has to complain about missing output.
+                priv.exec_waiting = true;
+                self.appendExecBar("waiting for the command to finish…");
             }
             return;
         }
@@ -928,6 +972,43 @@ pub const AiPanel = extern struct {
         priv.follow_last = null;
         priv.follow_ms = 0;
         priv.follow_active = false;
+    }
+
+    /// Shell-integration completion event for a surface in this tab:
+    /// authoritative "a command finished". Ends an in-flight capture
+    /// immediately (the exit code becomes the reply status) and
+    /// flushes a pending follow-up watch without the settle delay.
+    /// Manual commands the user runs fire this too; they are ignored
+    /// while nothing is being captured.
+    pub fn execPromptDone(self: *Self, exit_code: ?u8) void {
+        const priv = self.private();
+        if (!priv.exec_active and !priv.follow_active) return;
+        const tab = priv.tab orelse return;
+        const after = tab.dumpActiveSurfaceText(alloc()) catch return;
+        defer alloc().free(after);
+
+        if (priv.exec_active) {
+            var buf: [24]u8 = undefined;
+            const status: []const u8 = if (exit_code) |code| blk: {
+                break :blk if (code == 0) "done" else
+                    std.fmt.bufPrint(&buf, "exit {d}", .{code}) catch "done";
+            } else "done";
+            self.finishExec(status, after);
+            return;
+        }
+
+        // Follow-up watch: the shell just proved the screen settled.
+        const base = priv.follow_base orelse return;
+        if (std.mem.eql(u8, base, after)) return;
+        const id = priv.follow_id orelse return;
+        const from = if (after.len > 8192) after.len - 8192 else 0;
+        log.debug("exec follow-up output (prompt event) id={s}", .{id});
+        self.sendJson(struct {
+            type: []const u8 = "exec_output",
+            id: []const u8,
+            output: []const u8,
+        }{ .id = id, .output = after[from..] });
+        self.clearFollow();
     }
 
     fn finishExec(self: *Self, status: []const u8, output: []const u8) void {
@@ -1082,7 +1163,7 @@ pub const AiPanel = extern struct {
             \\    border-radius: 8px;
             \\    padding: 2px 8px;
             \\}
-            \\label.ai-exec {
+            \\.ai-exec {
             \\    background: rgba(229,181,103,0.22);
             \\    border-radius: 8px;
             \\    padding: 2px 8px;
@@ -1253,6 +1334,19 @@ pub const AiPanel = extern struct {
 
     }
 
+    /// "HH:MM" local time, for message arrival stamps.
+    fn stamp() ?[:0]u8 {
+        var t: i64 = time(null);
+        if (t < 0) return null;
+        const tm = localtime(&t) orelse return null;
+        return std.fmt.allocPrintSentinel(
+            alloc(),
+            "{d:0>2}:{d:0>2}",
+            .{ tm.hour, tm.min },
+            0,
+        ) catch null;
+    }
+
     /// A rounded, full-width child-label bar. Text tags can only paint
     /// hard rectangles, so transcript highlights that want css (corner
     /// radius, padding) are anchored widgets. Width is requested from
@@ -1314,10 +1408,26 @@ pub const AiPanel = extern struct {
         // selectable. Width-request spans the view so the bar reaches
         // the edges (computed at write time; old bars keep their
         // width across resizes, as with the old padding trick).
+        var stamped: [:0]const u8 = owned;
+        var stamped_alloc = false;
+        if (stamp()) |hm| {
+            defer alloc().free(hm);
+            if (std.fmt.allocPrintSentinel(
+                alloc(),
+                "{s}  ·  {s}",
+                .{ owned, hm },
+                0,
+            )) |v| {
+                stamped = v;
+                stamped_alloc = true;
+            } else |_| {}
+        }
+
         self.append("\n", null);
-        self.appendBar(owned, "ai-msg");
+        self.appendBar(stamped, "ai-msg");
         self.append("\n", null);
         self.scrollSoon();
+        if (stamped_alloc) alloc().free(stamped);
 
         if (!priv.ai_turn_open) self.sendChat(owned);
     }

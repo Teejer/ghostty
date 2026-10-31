@@ -374,6 +374,15 @@ pub const Tab = extern struct {
         }
     }
 
+    /// Shell integration reported a command completion on one of this
+    /// tab's surfaces. If the AI panel is capturing output for an
+    /// approved command, this is the authoritative done event; the
+    /// panel finishes immediately with the exit code instead of
+    /// waiting for the screen to look stable.
+    pub fn aiCommandFinished(self: *Self, exit_code: ?u8) void {
+        if (self.private().ai_panel) |panel| panel.execPromptDone(exit_code);
+    }
+
     /// Read the visible screen text of this tabs active surface. This is
     /// the core read path that lets the AI panel see the contents of its
     /// own tab and only its own tab. The returned string is allocated

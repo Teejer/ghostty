@@ -9,6 +9,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const apprt = @import("../../../apprt.zig");
+const Tab = @import("tab.zig").Tab;
 const build_config = @import("../../../build_config.zig");
 const build_options = @import("build_options");
 const configpkg = @import("../../../config.zig");
@@ -1173,6 +1174,13 @@ pub const Surface = extern struct {
         const app = Application.default();
         const alloc = app.allocator();
         const priv: *Private = self.private();
+
+        // ghostty-ai: hand the completion event (with exit code) to
+        // this surface's tab AI panel before any notification-policy
+        // filtering. The panel treats it as ground truth that a
+        // command it injected has finished.
+        if (ext.getAncestor(Tab, self.as(gtk.Widget))) |tab|
+            tab.aiCommandFinished(value.exit_code);
 
         const notify_next_command_finish = notify: {
             const simple_action_group = priv.action_group orelse break :notify false;
