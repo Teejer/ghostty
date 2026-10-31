@@ -48,6 +48,7 @@ pub const AiPanel = extern struct {
         name: []const u8 = "",
         label: []const u8 = "",
         model: []const u8 = "",
+        ok: bool = false,
     };
 
     /// A message received from the daemon.
@@ -63,6 +64,7 @@ pub const AiPanel = extern struct {
         id: ?[]const u8 = null,
         command: ?[]const u8 = null,
         auto: ?bool = null,
+        ok: ?bool = null,
     };
 
     const Private = struct {
@@ -106,7 +108,6 @@ pub const AiPanel = extern struct {
         /// Text tags: user messages get a blue background; thinking
         /// bodies are italic/dim and additionally invisible when
         /// collapsed.
-        tag_user: ?*gtk.TextTag = null,
         tag_think: ?*gtk.TextTag = null,
         tag_hidden: ?*gtk.TextTag = null,
 
@@ -136,6 +137,13 @@ pub const AiPanel = extern struct {
         /// css class currently applied so it can be swapped.
         dot: ?*gtk.Label = null,
         dot_class: ?[:0]const u8 = null,
+
+        /// Second light, next to the model dropdown: is the inference
+        /// engine (provider endpoint) reachable? And which provider
+        /// this tab currently uses, for matching provider_status.
+        prov_dot: ?*gtk.Label = null,
+        prov_dot_class: ?[:0]const u8 = null,
+        cur_provider: ?[]const u8 = null,
 
         /// Multiline prompt input; the scrolled window caps its growth
         /// at about five lines, and the placeholder label covers the
@@ -202,61 +210,6 @@ pub const AiPanel = extern struct {
         if (upper - page - value < 64) adj.setValue(upper);
     }
 
-    /// Pad the text inserted since start_off with spaces (tagged like
-    /// the text) so its background spans the full transcript width.
-    /// The transcript is monospace, so two adjacent cells give us the
-    /// glyph advance and thus the visible column count. Wrapped lines
-    /// are handled by filling to a multiple of the column count.
-    /// Padding is computed at write time: after a window resize, older
-    /// bars keep their old width.
-    fn padTaggedLine(self: *Self, start_off: usize) void {
-        const priv = self.private();
-        const buffer = priv.transcript.getBuffer();
-        var e: gtk.TextIter = undefined;
-        buffer.getEndIter(&e);
-        const end_off: usize = @intCast(e.getOffset());
-        const len = end_off -| start_off;
-        const cols = self.transcriptCols();
-
-        var pad = cols - (len % cols);
-        if (pad == cols) pad = 0; // exactly full
-        if (pad == 0 or pad > 4096) return;
-
-        const spaces = alloc().alloc(u8, pad) catch return;
-        defer alloc().free(spaces);
-        @memset(spaces, ' ');
-        self.append(spaces, priv.tag_user);
-    }
-
-    /// Approximate number of monospace columns visible in the
-    /// transcript view.
-    fn transcriptCols(self: *Self) usize {
-        const priv = self.private();
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx <= 0) return 80;
-        const width: usize = @intCast(wpx);
-
-        // Measure two adjacent cells on the last line. Offsets 0/1 are
-        // not safe: the transcript can legitimately start empty now,
-        // and a leading "\n" would put the two iters on different
-        // lines (advance 0).
-        const buffer = priv.transcript.getBuffer();
-        var ia: gtk.TextIter = undefined;
-        var ib: gtk.TextIter = undefined;
-        _ = buffer.getIterAtLine(&ia, buffer.getLineCount() - 1);
-        ib = ia;
-        if (ib.forwardChars(1) == 0) return 80;
-        if (ib.getLine() != ia.getLine()) return 80;
-        var r1: gdk.Rectangle = undefined;
-        var r2: gdk.Rectangle = undefined;
-        priv.transcript.getIterLocation(&ia, &r1);
-        priv.transcript.getIterLocation(&ib, &r2);
-        const advance: isize = r2.f_x - r1.f_x;
-        if (advance <= 0) return 80;
-
-        const usable: usize = if (width > 16) width - 16 else 2;
-        return @max(usable / @as(usize, @intCast(advance)), 20);
-    }
 
     /// Append text to the chat transcript.
     pub fn appendText(self: *Self, text: [:0]const u8) void {
@@ -441,6 +394,9 @@ pub const AiPanel = extern struct {
         if (std.mem.eql(u8, msg.type, "ready")) {
             const p = msg.provider orelse "?";
             self.setDot("ai-dot-ready");
+            const old = self.private().cur_provider;
+            self.private().cur_provider = alloc().dupe(u8, p) catch null;
+            if (old) |o| alloc().free(o);
             if (msg.message) |warning| {
                 self.appendSlice("\n[ghostty-ai] ");
                 self.appendSlice(warning);
@@ -498,6 +454,10 @@ pub const AiPanel = extern struct {
             }
         } else if (std.mem.eql(u8, msg.type, "exec_cancel")) {
             self.clearExecProposal();
+        } else if (std.mem.eql(u8, msg.type, "provider_status")) {
+            const cur = self.private().cur_provider orelse "";
+            if (std.mem.eql(u8, msg.provider orelse "", cur))
+                self.setProviderDot(msg.ok orelse false);
         } else if (std.mem.eql(u8, msg.type, "status")) {
             // No UI for turn states yet.
         }
@@ -560,8 +520,33 @@ pub const AiPanel = extern struct {
 
         if (priv.provider_row) |row| {
             row.append(drop.as(gtk.Widget));
+
+            // Engine light beside the picker: green when the daemon
+            // can reach this endpoint, dim when it cannot.
+            if (priv.prov_dot == null) {
+                const pd = gtk.Label.new("\u{25cf}");
+                pd.as(gtk.Widget).addCssClass("ai-dot");
+                priv.prov_dot = pd;
+                row.append(pd.as(gtk.Widget));
+            }
+            var ok_now = false;
+            for (infos) |inf| {
+                if (std.mem.eql(u8, inf.name, current)) ok_now = inf.ok;
+            }
+            self.setProviderDot(ok_now);
+
             row.as(gtk.Widget).setVisible(1);
         }
+    }
+
+    /// Swap the provider light's state class.
+    fn setProviderDot(self: *Self, ok: bool) void {
+        const priv = self.private();
+        const dot = (priv.prov_dot orelse return).as(gtk.Widget);
+        const state: [:0]const u8 = if (ok) "ai-dot-ready" else "ai-dot-off";
+        if (priv.prov_dot_class) |old| dot.removeCssClass(old);
+        dot.addCssClass(state);
+        priv.prov_dot_class = state;
     }
 
     fn onProviderNotify(
@@ -1000,6 +985,11 @@ pub const AiPanel = extern struct {
             \\label.ai-dot-off { color: alpha(currentColor, 0.30); }
             \\label.ai-dot-connecting { color: #e5b567; }
             \\label.ai-dot-ready { color: #4ec970; }
+            \\label.ai-msg {
+            \\    background: rgba(53,132,228,0.30);
+            \\    border-radius: 8px;
+            \\    padding: 2px 8px;
+            \\}
         ;
         const provider = gtk.CssProvider.new();
         provider.loadFromData(css.ptr, @intCast(css.len));
@@ -1065,12 +1055,6 @@ pub const AiPanel = extern struct {
         // triples terminated by a null property name; booleans go
         // through as C ints in the variadic.
         const buffer = transcript.getBuffer();
-        priv.tag_user = buffer.createTag(
-            "user_bg",
-            "background",
-            "rgba(53,132,228,0.30)",
-            @as(?[*:0]const u8, null),
-        );
         priv.tag_think = buffer.createTag(
             "think_style",
             "italic",
@@ -1188,16 +1172,37 @@ pub const AiPanel = extern struct {
         defer glib.free(owned.ptr);
         buffer.setText("", -1);
 
-        // Echo with a blank line before, padded out to the full
-        // transcript width so the blue reads as a bar, edge to edge.
+        // Echo as a rounded full-width bar. Tag backgrounds can only
+        // paint hard rectangles, so the message is a child-anchored
+        // label styled with css; it also makes sent messages
+        // selectable. Width-request spans the view so the bar reaches
+        // the edges (computed at write time; old bars keep their
+        // width across resizes, as with the old padding trick).
         const tbuf = priv.transcript.getBuffer();
         var it: gtk.TextIter = undefined;
         self.append("\n", null);
         tbuf.getEndIter(&it);
-        const start_off: usize = @intCast(it.getOffset());
-        self.append(owned, priv.tag_user);
-        self.padTaggedLine(start_off);
-        self.append("\n", priv.tag_user);
+        const anchor = tbuf.createChildAnchor(&it);
+        const bar = gtk.Label.new(owned);
+        bar.setXalign(0);
+        bar.setWrap(1);
+        bar.setSelectable(1);
+        bar.as(gtk.Widget).addCssClass("ai-msg");
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) {
+            // GTK4 has no width-request setter function; set the
+            // property (same dance as the panel's own width-request).
+            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+            defer wr_value.unset();
+            gobject.Object.setProperty(
+                bar.as(gobject.Object),
+                "width-request",
+                &wr_value,
+            );
+        }
+        priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
+        self.append("\n", null);
+        self.scrollSoon();
 
         if (!priv.ai_turn_open) self.sendChat(owned);
     }
@@ -1302,6 +1307,8 @@ pub const AiPanel = extern struct {
         disconnect(self, "");
         if (priv.scroll_soon) |id| _ = glib.Source.remove(id);
         priv.scroll_soon = null;
+        if (priv.cur_provider) |v| alloc().free(v);
+        priv.cur_provider = null;
         if (priv.tab_id) |id| glib.free(id);
         priv.tab_id = null;
         for (priv.provider_names) |n| alloc().free(n);
