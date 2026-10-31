@@ -131,6 +131,12 @@ pub const AiPanel = extern struct {
         turn_t0_ms: i64 = 0,
         turn_bytes: usize = 0,
 
+        /// Start of the in-flight AI turn's text range; the dark
+        /// background tag is repainted over [mark, end] as deltas
+        /// stream and fixed when the turn ends.
+        ai_turn_start: ?*gtk.TextMark = null,
+        tag_ai_bg: ?*gtk.TextTag = null,
+
         /// Text tags: user messages get a blue background; thinking
         /// bodies are italic/dim and additionally invisible when
         /// collapsed.
@@ -456,16 +462,23 @@ pub const AiPanel = extern struct {
                 priv.ai_turn_open = true;
                 priv.turn_t0_ms = nowMs();
                 priv.turn_bytes = 0;
-                self.appendText("\nai: ");
+                self.appendText("\n");
+                const buffer = priv.transcript.getBuffer();
+                if (priv.ai_turn_start) |m| buffer.deleteMark(m);
+                var mi: gtk.TextIter = undefined;
+                buffer.getEndIter(&mi);
+                priv.ai_turn_start = buffer.createMark(null, &mi, 1);
             }
             const txt: []const u8 = msg.text orelse "";
             priv.turn_bytes += txt.len;
             self.appendSlice(txt);
+            self.applyAiBgTag();
         } else if (std.mem.eql(u8, msg.type, "done")) {
             self.closeThinkingBlock();
             const priv = self.private();
             if (priv.ai_turn_open) {
                 priv.ai_turn_open = false;
+                self.endAiTurn();
                 if (stamp()) |hm| {
                     defer alloc().free(hm);
                     self.appendTurnCaption(hm);
@@ -495,7 +508,10 @@ pub const AiPanel = extern struct {
                 self.startExec(id, cmd);
             } else {
                 self.closeThinkingBlock();
-                self.private().ai_turn_open = false;
+                if (self.private().ai_turn_open) {
+                    self.private().ai_turn_open = false;
+                    self.endAiTurn();
+                }
                 self.appendExecProposal(id, cmd);
             }
         } else if (std.mem.eql(u8, msg.type, "exec_cancel")) {
@@ -1282,6 +1298,16 @@ pub const AiPanel = extern struct {
             "#9a9a9a",
             @as(?[*:0]const u8, null),
         );
+        priv.tag_ai_bg = buffer.createTag(
+            "ai_bg",
+            "background-set",
+            @as(c_int, 1),
+            "background",
+            "#000000",
+            "background-alpha",
+            @as(f64, 0.25),
+            @as(?[*:0]const u8, null),
+        );
         priv.tag_hidden = buffer.createTag(
             "think_hidden",
             "invisible",
@@ -1416,16 +1442,47 @@ pub const AiPanel = extern struct {
         label.as(gtk.Widget).addCssClass("ai-msg");
         row.append(label.as(gtk.Widget));
 
+        var stamp_lbl: ?*gtk.Label = null;
         if (hm) |t| {
-            const stamp_lbl = gtk.Label.new(t);
-            stamp_lbl.as(gtk.Widget).addCssClass("caption");
-            stamp_lbl.as(gtk.Widget).addCssClass("dim-label");
-            stamp_lbl.as(gtk.Widget).setValign(.end);
-            row.append(stamp_lbl.as(gtk.Widget));
+            const lbl = gtk.Label.new(t);
+            lbl.as(gtk.Widget).addCssClass("caption");
+            lbl.as(gtk.Widget).addCssClass("dim-label");
+            lbl.as(gtk.Widget).setValign(.end);
+            row.append(lbl.as(gtk.Widget));
+            stamp_lbl = lbl;
         }
 
+        // A TextView allocates children their natural width, and a
+        // wrapping label's natural width is the full unwrapped text,
+        // which pushed the time caption off-screen. Pinning the
+        // label's width-request also caps its natural width, so the
+        // row stays inside the view and the caption stays visible.
         const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
         if (wpx > 60) {
+            var label_w: c_int = wpx - 14;
+            if (stamp_lbl) |lbl| {
+                var cap_min: c_int = 0;
+                var cap_nat: c_int = 0;
+                lbl.as(gtk.Widget).measure(
+                    .horizontal,
+                    -1,
+                    &cap_min,
+                    &cap_nat,
+                    null,
+                    null,
+                );
+                label_w -= 6 + cap_nat;
+            }
+            label_w = @max(label_w, 40);
+
+            var lw_value = gobject.ext.Value.newFrom(label_w);
+            defer lw_value.unset();
+            gobject.Object.setProperty(
+                label.as(gobject.Object),
+                "width-request",
+                &lw_value,
+            );
+
             var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
             defer wr_value.unset();
             gobject.Object.setProperty(
@@ -1441,6 +1498,30 @@ pub const AiPanel = extern struct {
     /// rather than buffer text so it can carry a tooltip; the token
     /// count is estimated at ~4 bytes per token because these
     /// servers do not report usage on streamed responses.
+    /// Repaint the dark background over the streaming turn range.
+    fn applyAiBgTag(self: *Self) void {
+        const priv = self.private();
+        const start = priv.ai_turn_start orelse return;
+        const tag = priv.tag_ai_bg orelse return;
+        const buffer = priv.transcript.getBuffer();
+        var it_start: gtk.TextIter = undefined;
+        var it_end: gtk.TextIter = undefined;
+        buffer.getIterAtMark(&it_start, start);
+        buffer.getEndIter(&it_end);
+        buffer.applyTag(tag, &it_start, &it_end);
+    }
+
+    /// Fix the background range when the turn ends (answer done, or
+    /// an exec proposal cutting the text short) and drop the mark.
+    fn endAiTurn(self: *Self) void {
+        const priv = self.private();
+        self.applyAiBgTag();
+        if (priv.ai_turn_start) |m| {
+            priv.transcript.getBuffer().deleteMark(m);
+            priv.ai_turn_start = null;
+        }
+    }
+
     fn appendTurnCaption(self: *Self, hm: [:0]const u8) void {
         const priv = self.private();
         const a = alloc();
