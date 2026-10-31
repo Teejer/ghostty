@@ -187,6 +187,10 @@ pub const Tab = extern struct {
         /// do not clobber a manual resize when toggling the panel.
         ai_panel_positioned: bool = false,
 
+        /// Repeating timer that positions an auto-opened panel once the
+        /// tab has a width (tabs are constructed before allocation).
+        ai_position_timer: ?c_uint = null,
+
         pub var offset: c_int = 0;
     };
 
@@ -264,8 +268,11 @@ pub const Tab = extern struct {
         box.remove(split_tree);
 
         const paned = gtk.Paned.new(.horizontal);
-        paned.setResizeStartChild(0);
-        paned.setResizeEndChild(1);
+        // On window resize the terminal (start child) absorbs the size
+        // change and the panel keeps its width; the user drags the
+        // handle when they want the panel to change.
+        paned.setResizeStartChild(1);
+        paned.setResizeEndChild(0);
         paned.setShrinkStartChild(0);
         paned.setShrinkEndChild(1);
         paned.setWideHandle(1);
@@ -298,6 +305,43 @@ pub const Tab = extern struct {
             .{},
         );
         self.as(gtk.Widget).addController(ec_key.as(gtk.EventController));
+
+        // Fork preference: show the panel from the start. The tab has
+        // no size yet, so a short timer applies the initial split as
+        // soon as the paned has been allocated.
+        const app = Application.default();
+        const conf = app.getConfig();
+        defer conf.unref();
+        if (conf.get().@"ai-panel-default-open") {
+            panel.as(gtk.Widget).setVisible(1);
+            _ = panel.ensureConnected();
+            priv.ai_position_timer = glib.timeoutAdd(
+                200,
+                aiPanelPositionTick,
+                self,
+            );
+        }
+    }
+
+    /// Positions an auto-opened panel at its initial split once the
+    /// tab has a width. Self-stopping: returns 0 when done, disabled,
+    /// or positioned elsewhere.
+    fn aiPanelPositionTick(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud));
+        const priv = self.private();
+        priv.ai_position_timer = null;
+        if (priv.ai_panel_positioned) return 0;
+        const panel = (priv.ai_panel orelse return 0).as(gtk.Widget);
+        if (panel.getVisible() == 0) return 0;
+        const paned = priv.ai_paned orelse return 0;
+        const width = paned.as(gtk.Widget).getWidth();
+        if (width <= 0) {
+            priv.ai_position_timer = glib.timeoutAdd(200, aiPanelPositionTick, self);
+            return 0;
+        }
+        priv.ai_panel_positioned = true;
+        paned.setPosition(@intCast(@divTrunc(width * 2, 3)));
+        return 0;
     }
 
     /// Toggle this tabs AI panel visibility.
@@ -495,6 +539,10 @@ pub const Tab = extern struct {
 
     fn finalize(self: *Self) callconv(.c) void {
         const priv = self.private();
+        if (priv.ai_position_timer) |source_id| {
+            _ = glib.Source.remove(source_id);
+            priv.ai_position_timer = null;
+        }
         if (priv.tooltip) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.tooltip = null;

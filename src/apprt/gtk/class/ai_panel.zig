@@ -129,6 +129,9 @@ pub const AiPanel = extern struct {
         exec_stable_ms: u32 = 0,
         exec_tick: u32 = 0,
 
+        /// One-shot scroll timer (see scrollSoon).
+        scroll_soon: ?c_uint = null,
+
         /// Per-tab model picker. The provider list comes from the
         /// daemon and applies to this tab's session only.
         provider_row: ?*gtk.Box = null,
@@ -716,6 +719,24 @@ pub const AiPanel = extern struct {
         priv.exec_cmd = a.dupe(u8, cmd) catch return;
         priv.exec_run_btn = run;
         priv.exec_deny_btn = deny;
+        self.scrollSoon();
+    }
+
+    /// Scroll to the bottom shortly. Child widgets added at anchors
+    /// (the Run/Deny box) do not trigger a text-insert scroll, and the
+    /// scroll adjustment does not know their height until the next
+    /// layout pass, so a scroll now would land above them.
+    fn scrollSoon(self: *Self) void {
+        const priv = self.private();
+        if (priv.scroll_soon) |id| _ = glib.Source.remove(id);
+        priv.scroll_soon = glib.timeoutAdd(150, struct {
+            fn call(ud: ?*anyopaque) callconv(.c) c_int {
+                const self_: *Self = @ptrCast(@alignCast(ud));
+                self_.private().scroll_soon = null;
+                self_.scrollToBottomIfFollowing();
+                return 0;
+            }
+        }.call, self);
     }
 
     fn onExecRunClicked(
@@ -1102,6 +1123,8 @@ pub const AiPanel = extern struct {
             }{});
         }
         disconnect(self, "");
+        if (priv.scroll_soon) |id| _ = glib.Source.remove(id);
+        priv.scroll_soon = null;
         if (priv.tab_id) |id| glib.free(id);
         priv.tab_id = null;
         for (priv.provider_names) |n| alloc().free(n);

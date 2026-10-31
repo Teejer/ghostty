@@ -3868,6 +3868,13 @@ else
 /// Available since 1.4.0.
 @"gtk-horizontal-tab-scroll": bool = true,
 
+/// ghostty-ai fork option: if `true`, the AI panel docked to the right
+/// of each tab is shown as soon as the tab opens (at launch and for
+/// every new tab) instead of starting hidden. It can still be toggled
+/// with the panel keybinding. Requires the ghostty-ai daemon; without
+/// it the panel shows a connection note.
+@"ai-panel-default-open": bool = false,
+
 /// Custom CSS files to be loaded.
 ///
 /// GTK CSS documentation can be found at the following links:
