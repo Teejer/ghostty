@@ -144,6 +144,7 @@ pub const AiPanel = extern struct {
         input_scroll: ?*gtk.ScrolledWindow = null,
         input_placeholder: ?*gtk.Label = null,
         input_line_h: c_int = 0,
+        input_focused: bool = false,
 
         /// Per-tab model picker. The provider list comes from the
         /// daemon and applies to this tab's session only.
@@ -1138,6 +1139,26 @@ pub const AiPanel = extern struct {
         );
         input.as(gtk.Widget).addController(ec_in.as(gtk.EventController));
 
+        // Placeholder behaves like entry placeholder text: hidden while
+        // focused or non-empty, back only when blurred and empty.
+        placeholder.as(gtk.Widget).setValign(.start);
+        const ec_focus = gtk.EventControllerFocus.new();
+        _ = gtk.EventControllerFocus.signals.enter.connect(
+            ec_focus,
+            *Self,
+            onInputFocusIn,
+            self,
+            .{},
+        );
+        _ = gtk.EventControllerFocus.signals.leave.connect(
+            ec_focus,
+            *Self,
+            onInputFocusOut,
+            self,
+            .{},
+        );
+        input.as(gtk.Widget).addController(ec_focus.as(gtk.EventController));
+
         // TextBuffer.signals.changed is missing from the bindings'
         // connect structs, so attach it by name.
         _ = gobject.signalConnectData(
@@ -1195,6 +1216,30 @@ pub const AiPanel = extern struct {
         return 1;
     }
 
+    fn onInputFocusIn(
+        _: *gtk.EventControllerFocus,
+        self: *Self,
+    ) callconv(.c) void {
+        self.private().input_focused = true;
+        self.refreshPlaceholder();
+    }
+
+    fn onInputFocusOut(
+        _: *gtk.EventControllerFocus,
+        self: *Self,
+    ) callconv(.c) void {
+        self.private().input_focused = false;
+        self.refreshPlaceholder();
+    }
+
+    fn refreshPlaceholder(self: *Self) void {
+        const priv = self.private();
+        const ph = priv.input_placeholder orelse return;
+        const view = priv.input_view orelse return;
+        const empty = view.getBuffer().getCharCount() <= 0;
+        ph.as(gtk.Widget).setVisible(@intFromBool(empty and !priv.input_focused));
+    }
+
     /// Keeps the placeholder in step with the buffer and sizes the
     /// growth cap to exactly five lines of the real font once the text
     /// view has a layout.
@@ -1204,9 +1249,7 @@ pub const AiPanel = extern struct {
         const view = priv.input_view orelse return;
         const buffer = view.getBuffer();
 
-        const empty = buffer.getCharCount() <= 0;
-        if (priv.input_placeholder) |ph|
-            ph.as(gtk.Widget).setVisible(@intFromBool(empty));
+        self.refreshPlaceholder();
 
         if (priv.input_line_h <= 0) {
             var it: gtk.TextIter = undefined;
