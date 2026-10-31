@@ -130,6 +130,16 @@ pub const AiPanel = extern struct {
         exec_stable_ms: u32 = 0,
         exec_tick: u32 = 0,
 
+        /// Post-reply watch: slow commands settle, then print (sleep
+        /// && echo) or outlive the timeout. We keep comparing the
+        /// screen to what we already sent and push a late exec_output
+        /// if it changes and settles.
+        follow_active: bool = false,
+        follow_id: ?[]u8 = null,
+        follow_base: ?[]u8 = null,
+        follow_last: ?[]u8 = null,
+        follow_ms: u32 = 0,
+
         /// One-shot scroll timer (see scrollSoon).
         scroll_soon: ?c_uint = null,
 
@@ -362,7 +372,7 @@ pub const AiPanel = extern struct {
                 return 0;
             }
         }
-        if (priv.exec_active) self.execPollTick();
+        if (priv.exec_active or priv.follow_active) self.execPollTick();
         return 1;
     }
 
@@ -437,19 +447,24 @@ pub const AiPanel = extern struct {
             if (msg.auto orelse false) {
                 const auto_note = std.fmt.allocPrintSentinel(
                     alloc(),
-                    "\n[exec] auto-running: {s}\n",
+                    "exec: auto-running: {s}",
                     .{cmd},
                     0,
                 ) catch return;
                 defer alloc().free(auto_note);
-                self.appendText(auto_note);
+                self.appendExecBar(auto_note);
                 self.startExec(id, cmd);
             } else {
                 self.closeThinkingBlock();
                 self.private().ai_turn_open = false;
-                self.appendText("\n[exec] The AI wants to run this in your tab:\n");
-                self.appendSlice(cmd);
-                self.appendText("\n");
+                const ask = std.fmt.allocPrintSentinel(
+                    alloc(),
+                    "The AI wants to run this in your tab:\n{s}",
+                    .{cmd},
+                    0,
+                ) catch return;
+                defer alloc().free(ask);
+                self.appendExecBar(ask);
                 self.appendExecButtons(id, cmd);
             }
         } else if (std.mem.eql(u8, msg.type, "exec_cancel")) {
@@ -786,13 +801,14 @@ pub const AiPanel = extern struct {
         }
         w.writer.writeAll("\\n") catch return;
 
+        self.clearFollow();
         const tab = priv.tab orelse {
             self.execReply(id, "failed", "");
             return;
         };
         log.debug("exec approved, injecting id={s}", .{id});
         if (!tab.injectText(w.written())) {
-            self.appendText("[exec failed: no active surface]\n");
+            self.appendExecBar("exec failed: no active surface");
             self.execReply(id, "failed", "");
             return;
         }
@@ -821,38 +837,97 @@ pub const AiPanel = extern struct {
         const a = alloc();
         priv.exec_tick += 1;
         if (priv.exec_tick % 6 != 0) return;
-        priv.exec_elapsed_ms += 300;
 
         const tab = priv.tab orelse {
-            self.finishExec("failed", "");
+            if (priv.exec_active) self.finishExec("failed", "");
+            self.clearFollow();
             return;
         };
         const after = tab.dumpActiveSurfaceText(a) catch {
-            self.finishExec("failed", "");
+            if (priv.exec_active) self.finishExec("failed", "");
             return;
         };
         defer a.free(after);
 
-        const stable = priv.exec_last != null and
-            std.mem.eql(u8, priv.exec_last.?, after);
-        if (stable) {
-            priv.exec_stable_ms += 300;
-        } else {
-            priv.exec_stable_ms = 0;
-            if (priv.exec_last) |v| a.free(v);
-            priv.exec_last = a.dupe(u8, after) catch null;
+        if (priv.exec_active) {
+            priv.exec_elapsed_ms += 300;
+            const stable = priv.exec_last != null and
+                std.mem.eql(u8, priv.exec_last.?, after);
+            if (stable) {
+                priv.exec_stable_ms += 300;
+            } else {
+                priv.exec_stable_ms = 0;
+                if (priv.exec_last) |v| a.free(v);
+                priv.exec_last = a.dupe(u8, after) catch null;
+            }
+            const settle_ms: u32 = if (priv.exec_interactive) 700 else 900;
+            const timeout_ms: u32 = if (priv.exec_interactive) 4_000 else 30_000;
+            if (priv.exec_stable_ms >= settle_ms) {
+                self.finishExec("done", after);
+            } else if (priv.exec_elapsed_ms >= timeout_ms) {
+                self.finishExec(
+                    if (priv.exec_interactive) "interactive" else "timeout",
+                    after,
+                );
+            }
+            return;
+        }
+        self.followTick(after);
+    }
+
+    /// Post-reply watch, ~300ms cadence. If the screen diverges from
+    /// what we already sent and then settles, the command kept
+    /// working (or finished quietly); push the fresh screen as
+    /// exec_output and stop. Giving up after 60s unchanged / 120s
+    /// unstable keeps a chatty shell from keeping the watch forever.
+    fn followTick(self: *Self, after: []const u8) void {
+        const priv = self.private();
+        const a = alloc();
+        priv.follow_ms += 300;
+
+        const base = priv.follow_base orelse {
+            self.clearFollow();
+            return;
+        };
+        if (std.mem.eql(u8, base, after)) {
+            if (priv.follow_ms >= 60_000) self.clearFollow();
+            return;
         }
 
-        const settle_ms: u32 = if (priv.exec_interactive) 700 else 900;
-        const timeout_ms: u32 = if (priv.exec_interactive) 4_000 else 30_000;
-        if (priv.exec_stable_ms >= settle_ms) {
-            self.finishExec("done", after);
-        } else if (priv.exec_elapsed_ms >= timeout_ms) {
-            self.finishExec(
-                if (priv.exec_interactive) "interactive" else "timeout",
-                after,
-            );
+        const stable = priv.follow_last != null and
+            std.mem.eql(u8, priv.follow_last.?, after);
+        if (priv.follow_last) |v| a.free(v);
+        priv.follow_last = a.dupe(u8, after) catch null;
+        if (!stable) {
+            if (priv.follow_ms >= 120_000) self.clearFollow();
+            return;
         }
+
+        const id = priv.follow_id orelse {
+            self.clearFollow();
+            return;
+        };
+        const from = if (after.len > 8192) after.len - 8192 else 0;
+        log.debug("exec follow-up output id={s} bytes={d}", .{ id, after.len });
+        self.sendJson(struct {
+            type: []const u8 = "exec_output",
+            id: []const u8,
+            output: []const u8,
+        }{ .id = id, .output = after[from..] });
+        self.clearFollow();
+    }
+
+    fn clearFollow(self: *Self) void {
+        const priv = self.private();
+        const a = alloc();
+        if (priv.follow_id) |v| a.free(v);
+        if (priv.follow_base) |v| a.free(v);
+        if (priv.follow_last) |v| a.free(v);
+        priv.follow_id = null;
+        priv.follow_base = null;
+        priv.follow_last = null;
+        priv.follow_ms = 0;
+        priv.follow_active = false;
     }
 
     fn finishExec(self: *Self, status: []const u8, output: []const u8) void {
@@ -863,12 +938,28 @@ pub const AiPanel = extern struct {
         log.debug("exec finished status={s} output_bytes={}", .{ status, output.len });
         self.execReply(id, status, output[from..]);
         if (std.mem.eql(u8, status, "timeout")) {
-            self.appendText("[exec] still running; sent the model the output so far\n");
+            self.appendExecBar("exec: still running; sent the model the output so far");
         } else if (std.mem.eql(u8, status, "interactive")) {
-            self.appendText("[exec] looks interactive; sent partial output, will not drive it\n");
+            self.appendExecBar("exec: looks interactive; sent partial output, will not drive it");
         }
         priv.exec_active = false;
+
+        // Keep watching after done/timeout replies (not interactive:
+        // there the screen changes because the user is driving it).
+        const watch = std.mem.eql(u8, status, "done") or
+            std.mem.eql(u8, status, "timeout");
+        const follow_id = if (watch) (alloc().dupe(u8, id) catch null) else null;
+        const follow_base = if (watch) (alloc().dupe(u8, output) catch null) else null;
         self.clearExecStrings();
+        if (watch and follow_id != null and follow_base != null) {
+            priv.follow_active = true;
+            priv.follow_id = follow_id;
+            priv.follow_base = follow_base;
+            priv.follow_ms = 0;
+        } else {
+            if (follow_id) |v| alloc().free(v);
+            if (follow_base) |v| alloc().free(v);
+        }
     }
 
     fn execReply(
@@ -954,6 +1045,7 @@ pub const AiPanel = extern struct {
         priv.exec_active = false;
         priv.open_think = null;
         self.clearExecStrings();
+        self.clearFollow();
         priv.read_buf.clearRetainingCapacity();
         if (priv.poll_source) |source_id| {
             _ = glib.Source.remove(source_id);
@@ -987,6 +1079,11 @@ pub const AiPanel = extern struct {
             \\label.ai-dot-ready { color: #4ec970; }
             \\label.ai-msg {
             \\    background: rgba(53,132,228,0.30);
+            \\    border-radius: 8px;
+            \\    padding: 2px 8px;
+            \\}
+            \\label.ai-exec {
+            \\    background: rgba(229,181,103,0.22);
             \\    border-radius: 8px;
             \\    padding: 2px 8px;
             \\}
@@ -1156,6 +1253,45 @@ pub const AiPanel = extern struct {
 
     }
 
+    /// A rounded, full-width child-label bar. Text tags can only paint
+    /// hard rectangles, so transcript highlights that want css (corner
+    /// radius, padding) are anchored widgets. Width is requested from
+    /// the current view width; old bars keep their width across
+    /// resizes.
+    fn appendBar(self: *Self, text: [:0]const u8, css_class: [:0]const u8) void {
+        const priv = self.private();
+        const tbuf = priv.transcript.getBuffer();
+        var it: gtk.TextIter = undefined;
+        tbuf.getEndIter(&it);
+        const anchor = tbuf.createChildAnchor(&it);
+        const bar = gtk.Label.new(text);
+        bar.setXalign(0);
+        bar.setWrap(1);
+        bar.setSelectable(1);
+        bar.as(gtk.Widget).addCssClass(css_class);
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) {
+            // GTK4 has no width-request setter function; set the
+            // property (same dance as the panel's own width-request).
+            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+            defer wr_value.unset();
+            gobject.Object.setProperty(
+                bar.as(gobject.Object),
+                "width-request",
+                &wr_value,
+            );
+        }
+        priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
+    }
+
+    /// A standalone amber exec-status line.
+    fn appendExecBar(self: *Self, text: [:0]const u8) void {
+        self.append("\n", null);
+        self.appendBar(text, "ai-exec");
+        self.append("\n", null);
+        self.scrollSoon();
+    }
+
     /// Send the input buffer as a chat message.
     fn sendInput(self: *Self) void {
         const priv = self.private();
@@ -1178,29 +1314,8 @@ pub const AiPanel = extern struct {
         // selectable. Width-request spans the view so the bar reaches
         // the edges (computed at write time; old bars keep their
         // width across resizes, as with the old padding trick).
-        const tbuf = priv.transcript.getBuffer();
-        var it: gtk.TextIter = undefined;
         self.append("\n", null);
-        tbuf.getEndIter(&it);
-        const anchor = tbuf.createChildAnchor(&it);
-        const bar = gtk.Label.new(owned);
-        bar.setXalign(0);
-        bar.setWrap(1);
-        bar.setSelectable(1);
-        bar.as(gtk.Widget).addCssClass("ai-msg");
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx > 60) {
-            // GTK4 has no width-request setter function; set the
-            // property (same dance as the panel's own width-request).
-            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-            defer wr_value.unset();
-            gobject.Object.setProperty(
-                bar.as(gobject.Object),
-                "width-request",
-                &wr_value,
-            );
-        }
-        priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
+        self.appendBar(owned, "ai-msg");
         self.append("\n", null);
         self.scrollSoon();
 
