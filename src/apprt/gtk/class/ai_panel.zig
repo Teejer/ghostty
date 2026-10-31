@@ -12,6 +12,9 @@ const gtk = @import("gtk");
 
 const Common = @import("../class.zig").Common;
 
+const Application = @import("application.zig").Application;
+const Tab = @import("tab.zig").Tab;
+
 pub const AiPanel = extern struct {
     const Self = @This();
     parent_instance: Parent,
@@ -26,11 +29,20 @@ pub const AiPanel = extern struct {
         /// Chat transcript shown to the user.
         transcript: *gtk.TextView = undefined,
 
+        /// The tab this panel belongs to. A panel can only ever read or
+        /// affect its own tab and the tab always outlives the panel.
+        tab: ?*Tab = null,
+
         pub var offset: c_int = 0;
     };
 
     pub fn new() *Self {
         return gobject.ext.newInstance(Self, .{});
+    }
+
+    /// Bind this panel to the tab that owns it.
+    pub fn setTab(self: *Self, tab: *Tab) void {
+        self.private().tab = tab;
     }
 
     /// Append text to the chat transcript.
@@ -110,11 +122,28 @@ pub const AiPanel = extern struct {
         entry: *gtk.Entry,
         self: *Self,
     ) callconv(.c) void {
+        const priv = self.private();
         const text = std.mem.span(entry.as(gtk.Editable).getText());
 
         self.appendText("you: ");
         self.appendText(text);
-        self.appendText("\n(ai backend not connected yet)\n\n");
+
+        // Read the visible screen of our own tab. This proves the read
+        // path and the per-tab isolation boundary; the real agent will
+        // send this same text to the model as context.
+        if (priv.tab) |tab| {
+            const alloc = Application.default().allocator();
+            if (tab.dumpActiveSurfaceText(alloc)) |screen| {
+                defer alloc.free(screen);
+                self.appendText("\n[screen of this tab]\n");
+                self.appendText(screen);
+                self.appendText("\n\n");
+            } else |_| {
+                self.appendText("\n[no active surface in this tab]\n\n");
+            }
+        } else {
+            self.appendText("\n[panel has no tab bound]\n\n");
+        }
 
         entry.as(gtk.Editable).setText("");
     }

@@ -6,9 +6,12 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
+const Allocator = std.mem.Allocator;
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const CoreSurface = @import("../../../Surface.zig");
+const global = @import("../../../global.zig");
+const terminal = @import("../../../terminal/main.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -273,6 +276,7 @@ pub const Tab = extern struct {
         // the handle when the end child is invisible, so a hidden panel
         // looks exactly like the stock layout.
         const panel = AiPanel.new();
+        panel.setTab(self);
         panel.as(gtk.Widget).setVisible(0);
         paned.setEndChild(panel.as(gtk.Widget));
         box.append(paned.as(gtk.Widget));
@@ -318,6 +322,45 @@ pub const Tab = extern struct {
                 }
             }
         }
+    }
+
+    /// Read the visible screen text of this tabs active surface. This is
+    /// the core read path that lets the AI panel see the contents of its
+    /// own tab and only its own tab. The returned string is allocated
+    /// with the given allocator and owned by the caller.
+    pub fn dumpActiveSurfaceText(
+        self: *Self,
+        alloc: Allocator,
+    ) ![:0]const u8 {
+        const gtk_surface = (self.getActiveSurface()) orelse
+            return error.NoActiveSurface;
+        const core = gtk_surface.core() orelse return error.NoActiveSurface;
+
+        // The renderer state mutex must be held to read terminal state.
+        // We hold it only long enough to copy out the text, never across
+        // anything slow like network I/O.
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+
+        const screen: *terminal.Screen =
+            core.renderer_state.terminal.screens.active;
+
+        // A selection covering the full visible viewport. This is the
+        // same text-extraction path that copy-to-clipboard uses.
+        const tl = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }) orelse
+            return error.NoActiveSurface;
+        const br = screen.pages.pin(.{ .viewport = .{
+            .x = screen.pages.cols - 1,
+            .y = @intCast(screen.pages.rows - 1),
+        } }) orelse return error.NoActiveSurface;
+
+        return try screen.selectionString(alloc, .{
+            .sel = .{
+                .bounds = .{ .untracked = .{ .start = tl, .end = br } },
+                .rectangle = false,
+            },
+            .trim = false,
+        });
     }
 
     fn aiPanelKeyPressed(
