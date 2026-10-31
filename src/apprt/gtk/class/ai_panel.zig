@@ -29,6 +29,8 @@ const global = @import("../../../global.zig");
 const Application = @import("application.zig").Application;
 const Tab = @import("tab.zig").Tab;
 
+const log = std.log.scoped(.gtk_ai_panel);
+
 pub const AiPanel = extern struct {
     const Self = @This();
     parent_instance: Parent,
@@ -48,6 +50,7 @@ pub const AiPanel = extern struct {
         state: ?[]const u8 = null,
         provider: ?[]const u8 = null,
         model: ?[]const u8 = null,
+        providers: [][]const u8 = &.{},
     };
 
     const Private = struct {
@@ -73,6 +76,13 @@ pub const AiPanel = extern struct {
         /// True while we are mid-way writing an assistant turn so we
         /// only prefix the "ai: " label once per turn.
         ai_turn_open: bool = false,
+
+        /// Per-tab model picker. The provider list comes from the
+        /// daemon and applies to this tab's session only.
+        provider_row: ?*gtk.Box = null,
+        provider_drop: ?*gtk.DropDown = null,
+        provider_names: [][]const u8 = &.{},
+        providers_updating: bool = false,
 
         pub var offset: c_int = 0;
     };
@@ -136,9 +146,11 @@ pub const AiPanel = extern struct {
 
         var path_buf: [4096]u8 = undefined;
         const path = daemonSocketPath(&path_buf) orelse {
+            log.warn("no XDG_RUNTIME_DIR or GHOSTTY_AI_SOCKET in env", .{});
             self.appendText("[ghostty-ai] XDG_RUNTIME_DIR unset; cannot find daemon socket\n\n");
             return false;
         };
+        log.debug("connecting to daemon path={s}", .{path});
 
         const fd = socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         if (fd < 0) {
@@ -161,7 +173,9 @@ pub const AiPanel = extern struct {
             @ptrCast(&addr),
             @sizeOf(c.sockaddr.un),
         ) < 0) {
+            const err = std.c._errno().*;
             _ = close(fd);
+            log.warn("connect failed path={s} errno={d}", .{ path, err });
             self.appendSlice(
                 "[ghostty-ai] daemon not running — start it with `ghostty-ai`\n\n",
             );
@@ -207,6 +221,7 @@ pub const AiPanel = extern struct {
             const n = write(priv.fd, @ptrCast(left.ptr), left.len);
             if (n < 0) {
                 if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                log.warn("daemon write failed fd={d}", .{priv.fd});
                 return; // EAGAIN or error: drop (MVP)
             }
             left = left[@intCast(n)..];
@@ -262,7 +277,10 @@ pub const AiPanel = extern struct {
             alloc(),
             line,
             .{ .ignore_unknown_fields = true },
-        ) catch return;
+        ) catch |err| {
+            log.warn("unparseable daemon line err={} line={s}", .{ err, line });
+            return;
+        };
         defer parsed.deinit();
         const msg = parsed.value;
 
@@ -282,6 +300,7 @@ pub const AiPanel = extern struct {
                 self.appendSlice(warning);
                 self.appendText("\n\n");
             }
+            if (msg.providers.len > 0) self.rebuildProviders(msg.providers, p);
         } else if (std.mem.eql(u8, msg.type, "delta")) {
             const priv = self.private();
             if (!priv.ai_turn_open) {
@@ -306,8 +325,76 @@ pub const AiPanel = extern struct {
         }
     }
 
-    fn disconnect(self: *Self, note: [:0]const u8) void {
+    /// Rebuild the per-tab model picker from the daemon's provider list,
+    /// selecting the session's current provider.
+    fn rebuildProviders(self: *Self, names: [][]const u8, current: []const u8) void {
         const priv = self.private();
+        const a = alloc();
+
+        for (priv.provider_names) |n| a.free(n);
+        priv.provider_names = a.alloc([]const u8, names.len) catch return;
+        for (names, 0..) |n, i| {
+            priv.provider_names[i] = a.dupe(u8, n) catch return;
+        }
+
+        // GTK wants a null-terminated array of C strings; it dups them.
+        var strs: std.ArrayList(?[*:0]const u8) = .empty;
+        defer strs.deinit(a);
+        for (priv.provider_names) |n| {
+            const z = glib.ext.dupeZ(u8, n);
+            strs.append(a, z.ptr) catch {};
+            defer glib.free(z.ptr);
+        }
+        strs.append(a, null) catch return;
+
+        // Replace the old dropdown, if any.
+        if (priv.provider_drop) |old| {
+            if (priv.provider_row) |row| row.remove(old.as(gtk.Widget));
+            priv.provider_drop = null;
+        }
+
+        const drop = gtk.DropDown.newFromStrings(@ptrCast(strs.items.ptr));
+        var sel: c_uint = 0;
+        for (priv.provider_names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, current)) sel = @intCast(i);
+        }
+        drop.setSelected(sel);
+
+        // Connect after setting the initial selection so we do not
+        // immediately send a redundant set_provider.
+        _ = gobject.Object.signals.notify.connect(
+            drop.as(gobject.Object),
+            *Self,
+            onProviderNotify,
+            self,
+            .{ .detail = "selected" },
+        );
+        priv.provider_drop = drop;
+
+        if (priv.provider_row) |row| {
+            row.append(drop.as(gtk.Widget));
+            row.as(gtk.Widget).setVisible(1);
+        }
+    }
+
+    fn onProviderNotify(
+        _: *gobject.Object,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const drop = priv.provider_drop orelse return;
+        const idx: usize = @intCast(drop.getSelected());
+        if (idx >= priv.provider_names.len) return;
+        const name = priv.provider_names[idx];
+        log.debug("provider selected name={s}", .{name});
+        self.sendJson(struct {
+            type: []const u8 = "set_provider",
+            provider: []const u8,
+        }{ .provider = name });
+    }
+
+    fn disconnect(self: *Self, note: [:0]const u8) void {        const priv = self.private();
         if (priv.fd >= 0) {
             _ = close(priv.fd);
         }
@@ -352,6 +439,15 @@ pub const AiPanel = extern struct {
         header.as(gtk.Widget).addCssClass("title-4");
         header.setXalign(0);
         box.append(header.as(gtk.Widget));
+
+        // Model picker row: shown once the daemon tells us which
+        // providers exist. The choice is per tab.
+        const provider_row = gtk.Box.new(.horizontal, 6);
+        const provider_label = gtk.Label.new("Model:");
+        provider_row.append(provider_label.as(gtk.Widget));
+        provider_row.as(gtk.Widget).setVisible(0);
+        priv.provider_row = provider_row;
+        box.append(provider_row.as(gtk.Widget));
 
         // Transcript.
         const scroller: *gtk.ScrolledWindow = .new();
@@ -437,6 +533,8 @@ pub const AiPanel = extern struct {
         disconnect(self, "");
         if (priv.tab_id) |id| glib.free(id);
         priv.tab_id = null;
+        for (priv.provider_names) |n| alloc().free(n);
+        priv.provider_names = &.{};
         priv.read_buf.deinit(alloc());
 
         gobject.Object.virtual_methods.finalize.call(
