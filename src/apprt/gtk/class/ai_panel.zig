@@ -525,11 +525,8 @@ pub const AiPanel = extern struct {
         if (priv.fd < 0) return;
 
         // Read the visible screen of our own tab as model context.
-        // Keep the sentinel in the owned slice: the allocation includes
-        // the terminator byte and freeing a shortened slice would be a
-        // size-mismatched free.
         var screen: []const u8 = "";
-        var screen_owned: ?[:0]const u8 = null;
+        var screen_owned: ?[]const u8 = null;
         defer if (screen_owned) |s| alloc().free(s);
         if (priv.tab) |tab| {
             if (tab.dumpActiveSurfaceText(alloc())) |s| {

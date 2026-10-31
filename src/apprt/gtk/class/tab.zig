@@ -337,7 +337,7 @@ pub const Tab = extern struct {
     pub fn dumpActiveSurfaceText(
         self: *Self,
         alloc: Allocator,
-    ) ![:0]const u8 {
+    ) ![]const u8 {
         const gtk_surface = (self.getActiveSurface()) orelse
             return error.NoActiveSurface;
         const core = gtk_surface.core() orelse return error.NoActiveSurface;
@@ -348,25 +348,10 @@ pub const Tab = extern struct {
         core.renderer_state.mutex.lockUncancelable(global.io());
         defer core.renderer_state.mutex.unlock(global.io());
 
-        const screen: *terminal.Screen =
-            core.renderer_state.terminal.screens.active;
-
-        // A selection covering the full visible viewport. This is the
-        // same text-extraction path that copy-to-clipboard uses.
-        const tl = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }) orelse
-            return error.NoActiveSurface;
-        const br = screen.pages.pin(.{ .viewport = .{
-            .x = screen.pages.cols - 1,
-            .y = @intCast(screen.pages.rows - 1),
-        } }) orelse return error.NoActiveSurface;
-
-        return try screen.selectionString(alloc, .{
-            .sel = .{
-                .bounds = .{ .untracked = .{ .start = tl, .end = br } },
-                .rectangle = false,
-            },
-            .trim = false,
-        });
+        // The core's own screen dump, same as the inspector and tests:
+        // ".active" is the visible screen without scrollback.
+        return try core.renderer_state.terminal.screens.active
+            .dumpStringAlloc(alloc, .{ .active = .{} });
     }
 
     fn aiPanelKeyPressed(
