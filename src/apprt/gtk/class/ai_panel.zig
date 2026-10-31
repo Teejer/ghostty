@@ -34,6 +34,12 @@ const Tm = extern struct {
 };
 extern fn localtime(timer: *const i64) callconv(.c) ?*Tm;
 extern fn time(arg: ?*anyopaque) callconv(.c) i64;
+
+const TimeVal = extern struct {
+    sec: i64,
+    usec: i64,
+};
+extern fn gettimeofday(tv: *TimeVal, tz: ?*anyopaque) callconv(.c) c_int;
 const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
@@ -119,6 +125,11 @@ pub const AiPanel = extern struct {
         /// True while we are mid-way writing an assistant turn so we
         /// only prefix the "ai: " label once per turn.
         ai_turn_open: bool = false,
+
+        /// Stats for the in-flight AI turn, shown as an estimated
+        /// generation rate in the turn caption's tooltip.
+        turn_t0_ms: i64 = 0,
+        turn_bytes: usize = 0,
 
         /// Text tags: user messages get a blue background; thinking
         /// bodies are italic/dim and additionally invisible when
@@ -443,24 +454,22 @@ pub const AiPanel = extern struct {
             self.closeThinkingBlock();
             if (!priv.ai_turn_open) {
                 priv.ai_turn_open = true;
-                if (stamp()) |hm| {
-                    defer alloc().free(hm);
-                    const prefix = std.fmt.allocPrintSentinel(
-                        alloc(),
-                        "\nai · {s}: ",
-                        .{hm},
-                        0,
-                    ) catch return;
-                    defer alloc().free(prefix);
-                    self.appendText(prefix);
-                } else self.appendText("\nai: ");
+                priv.turn_t0_ms = nowMs();
+                priv.turn_bytes = 0;
+                self.appendText("\nai: ");
             }
-            self.appendSlice(msg.text orelse "");
+            const txt: []const u8 = msg.text orelse "";
+            priv.turn_bytes += txt.len;
+            self.appendSlice(txt);
         } else if (std.mem.eql(u8, msg.type, "done")) {
             self.closeThinkingBlock();
             const priv = self.private();
             if (priv.ai_turn_open) {
                 priv.ai_turn_open = false;
+                if (stamp()) |hm| {
+                    defer alloc().free(hm);
+                    self.appendTurnCaption(hm);
+                }
                 self.appendText("\n");
             }
         } else if (std.mem.eql(u8, msg.type, "error")) {
@@ -1364,17 +1373,108 @@ pub const AiPanel = extern struct {
 
     }
 
+    /// Unix epoch milliseconds; 0 if the syscall fails.
+    fn nowMs() i64 {
+        var tv: TimeVal = undefined;
+        if (gettimeofday(&tv, null) < 0) return 0;
+        return tv.sec * 1000 + @divTrunc(tv.usec, 1000);
+    }
+
     /// "HH:MM" local time, for message arrival stamps.
     fn stamp() ?[:0]u8 {
         var t: i64 = time(null);
         if (t < 0) return null;
         const tm = localtime(&t) orelse return null;
+        // Unsigned: 0.17's formatter force-signs c_int values
+        // ("+17"). Verified with zig run.
         return std.fmt.allocPrintSentinel(
             alloc(),
             "{d:0>2}:{d:0>2}",
-            .{ tm.hour, tm.min },
+            .{
+                @as(u32, @intCast(tm.hour)),
+                @as(u32, @intCast(tm.min)),
+            },
             0,
         ) catch null;
+    }
+
+    /// User message bar: the blue pill wraps only the message text;
+    /// the arrival time sits beside it as a small dim caption.
+    fn appendMsgBar(self: *Self, text: [:0]const u8, hm: ?[:0]const u8) void {
+        const priv = self.private();
+        const tbuf = priv.transcript.getBuffer();
+        var it: gtk.TextIter = undefined;
+        tbuf.getEndIter(&it);
+        const anchor = tbuf.createChildAnchor(&it);
+
+        const row = gtk.Box.new(.horizontal, 6);
+        const label = gtk.Label.new(text);
+        label.setXalign(0);
+        label.setWrap(1);
+        label.setSelectable(1);
+        label.as(gtk.Widget).setHexpand(1);
+        label.as(gtk.Widget).addCssClass("ai-msg");
+        row.append(label.as(gtk.Widget));
+
+        if (hm) |t| {
+            const stamp_lbl = gtk.Label.new(t);
+            stamp_lbl.as(gtk.Widget).addCssClass("caption");
+            stamp_lbl.as(gtk.Widget).addCssClass("dim-label");
+            stamp_lbl.as(gtk.Widget).setValign(.end);
+            row.append(stamp_lbl.as(gtk.Widget));
+        }
+
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) {
+            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+            defer wr_value.unset();
+            gobject.Object.setProperty(
+                row.as(gobject.Object),
+                "width-request",
+                &wr_value,
+            );
+        }
+        priv.transcript.addChildAtAnchor(row.as(gtk.Widget), anchor);
+    }
+
+    /// Small dim "· HH:MM" caption closing an AI turn. A child widget
+    /// rather than buffer text so it can carry a tooltip; the token
+    /// count is estimated at ~4 bytes per token because these
+    /// servers do not report usage on streamed responses.
+    fn appendTurnCaption(self: *Self, hm: [:0]const u8) void {
+        const priv = self.private();
+        const a = alloc();
+        const tbuf = priv.transcript.getBuffer();
+        var it: gtk.TextIter = undefined;
+        tbuf.getEndIter(&it);
+        const anchor = tbuf.createChildAnchor(&it);
+
+        const text = std.fmt.allocPrintSentinel(
+            a,
+            " · {s}",
+            .{hm},
+            0,
+        ) catch return;
+        defer a.free(text);
+
+        const label = gtk.Label.new(text);
+        label.as(gtk.Widget).addCssClass("caption");
+        label.as(gtk.Widget).addCssClass("dim-label");
+
+        const ms: i64 = @max(1, nowMs() -% priv.turn_t0_ms);
+        const tokens = priv.turn_bytes / 4;
+        const rate = tokens * 1000 / @as(u64, @intCast(ms));
+        if (std.fmt.allocPrintSentinel(
+            a,
+            "~{d} tokens in ~{d} ms · ~{d} tok/s",
+            .{ tokens, ms, rate },
+            0,
+        )) |tip| {
+            defer a.free(tip);
+            label.as(gtk.Widget).setTooltipText(tip);
+        } else |_| {}
+
+        priv.transcript.addChildAtAnchor(label.as(gtk.Widget), anchor);
     }
 
     /// A rounded, full-width child-label bar. Text tags can only paint
@@ -1438,26 +1538,13 @@ pub const AiPanel = extern struct {
         // selectable. Width-request spans the view so the bar reaches
         // the edges (computed at write time; old bars keep their
         // width across resizes, as with the old padding trick).
-        var stamped: [:0]const u8 = owned;
-        var stamped_alloc = false;
-        if (stamp()) |hm| {
-            defer alloc().free(hm);
-            if (std.fmt.allocPrintSentinel(
-                alloc(),
-                "{s}  ·  {s}",
-                .{ owned, hm },
-                0,
-            )) |v| {
-                stamped = v;
-                stamped_alloc = true;
-            } else |_| {}
-        }
+        const hm = stamp();
+        defer if (hm) |v| alloc().free(v);
 
         self.append("\n", null);
-        self.appendBar(stamped, "ai-msg");
+        self.appendMsgBar(owned, hm);
         self.append("\n", null);
         self.scrollSoon();
-        if (stamped_alloc) alloc().free(stamped);
 
         if (!priv.ai_turn_open) self.sendChat(owned);
     }
