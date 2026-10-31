@@ -1042,11 +1042,15 @@ pub const AiPanel = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+
+        // getText() borrows the entry's buffer; own our copy before
+        // anything reallocates it (clearing the entry or the echo's
+        // allocations would otherwise leave `text` dangling).
         const text = std.mem.span(entry.as(gtk.Editable).getText());
         if (text.len == 0) return;
+        const owned = glib.ext.dupeZ(u8, text);
+        defer glib.free(owned.ptr);
 
-        // One echo line so the blue background covers the whole
-        // message, prefix included.
         // A blank line before, then the message padded out to the full
         // transcript width so the blue reads as a bar, edge to edge.
         const buffer = priv.transcript.getBuffer();
@@ -1054,12 +1058,12 @@ pub const AiPanel = extern struct {
         self.append("\n", null);
         buffer.getEndIter(&it);
         const start_off: usize = @intCast(it.getOffset());
-        self.append(text, priv.tag_user);
+        self.append(owned, priv.tag_user);
         self.padTaggedLine(start_off);
         self.append("\n", priv.tag_user);
         entry.as(gtk.Editable).setText("");
 
-        if (!priv.ai_turn_open) self.sendChat(text);
+        if (!priv.ai_turn_open) self.sendChat(owned);
     }
 
     fn sendChat(self: *Self, text: []const u8) void {
