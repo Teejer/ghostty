@@ -62,8 +62,22 @@ pub const AiPanel = extern struct {
     };
 
     const Private = struct {
+        /// One collapsible "thinking" block in the transcript. The
+        /// button is a child anchor inside the TextView; the body text
+        /// spans the two marks and is hidden via the shared invisible
+        /// tag when collapsed.
+        const ThinkingBlock = struct {
+            button: *gtk.Button,
+            start: *gtk.TextMark,
+            end: ?*gtk.TextMark = null,
+            hidden: bool = true,
+        };
+
         /// Chat transcript shown to the user.
         transcript: *gtk.TextView = undefined,
+
+        /// Scroller around the transcript, for auto-scroll.
+        scroller: *gtk.ScrolledWindow = undefined,
 
         /// The tab this panel belongs to. A panel can only ever read or
         /// affect its own tab and the tab always outlives the panel.
@@ -85,6 +99,18 @@ pub const AiPanel = extern struct {
         /// only prefix the "ai: " label once per turn.
         ai_turn_open: bool = false,
 
+        /// Text tags: user messages get a blue background; thinking
+        /// bodies are italic/dim and additionally invisible when
+        /// collapsed.
+        tag_user: ?*gtk.TextTag = null,
+        tag_think: ?*gtk.TextTag = null,
+        tag_hidden: ?*gtk.TextTag = null,
+
+        /// Collapsible thinking blocks; open_think indexes the block
+        /// currently receiving reasoning deltas, if any.
+        thinking_blocks: std.ArrayList(ThinkingBlock) = .empty,
+        open_think: ?usize = null,
+
         /// Per-tab model picker. The provider list comes from the
         /// daemon and applies to this tab's session only.
         provider_row: ?*gtk.Box = null,
@@ -104,25 +130,51 @@ pub const AiPanel = extern struct {
         self.private().tab = tab;
     }
 
-    /// Append text to the chat transcript.
-    pub fn appendText(self: *Self, text: [:0]const u8) void {
+    /// Append text to the chat transcript with an optional tag.
+    fn append(self: *Self, text: []const u8, tag: ?*gtk.TextTag) void {
         const priv = self.private();
         const buffer = priv.transcript.getBuffer();
-        var iter: gtk.TextIter = undefined;
-        buffer.getEndIter(&iter);
-        buffer.insert(&iter, text, -1);
 
-        // Keep the newest text visible.
-        buffer.getEndIter(&iter);
-        const mark = buffer.getMark("insert").?;
-        buffer.moveMark(mark, &iter);
+        const z = glib.ext.dupeZ(u8, text);
+        defer glib.free(z.ptr);
+
+        var start_iter: gtk.TextIter = undefined;
+        buffer.getEndIter(&start_iter);
+        const start_off = start_iter.getOffset();
+
+        buffer.insert(&start_iter, z, -1);
+
+        if (tag) |t| {
+            var s: gtk.TextIter = undefined;
+            var e: gtk.TextIter = undefined;
+            buffer.getIterAtOffset(&s, start_off);
+            buffer.getEndIter(&e);
+            buffer.applyTag(t, &s, &e);
+        }
+
+        self.scrollToBottomIfFollowing();
+    }
+
+    /// Auto-scroll, but only when the user was already looking at the
+    /// bottom, so scrolling up through old chat is not hijacked by
+    /// streaming output.
+    fn scrollToBottomIfFollowing(self: *Self) void {
+        const priv = self.private();
+        const adj = priv.scroller.getVadjustment();
+        const upper = adj.getUpper();
+        const page = adj.getPageSize();
+        const value = adj.getValue();
+        if (upper - page - value < 64) adj.setValue(upper);
+    }
+
+    /// Append text to the chat transcript.
+    pub fn appendText(self: *Self, text: [:0]const u8) void {
+        self.append(text, null);
     }
 
     /// Append arbitrary (non-terminated) text to the transcript.
     fn appendSlice(self: *Self, text: []const u8) void {
-        const z = glib.ext.dupeZ(u8, text);
-        defer glib.free(z.ptr);
-        self.appendText(z);
+        self.append(text, null);
     }
 
     //---------------------------------------------------------------
@@ -199,8 +251,9 @@ pub const AiPanel = extern struct {
 
         priv.fd = fd;
 
-        // Start the read timer.
-        priv.poll_source = glib.timeoutAdd(100, pollDaemon, self);
+        // Start the read timer. 50ms keeps streaming visually smooth
+        // without a thread or GIO async machinery.
+        priv.poll_source = glib.timeoutAdd(50, pollDaemon, self);
 
         // Register our session.
         const tab_id = priv.tab_id orelse return false;
@@ -310,20 +363,28 @@ pub const AiPanel = extern struct {
                 self.appendText("\n\n");
             }
             if (msg.providers.len > 0) self.rebuildProviders(msg.providers, p);
+        } else if (std.mem.eql(u8, msg.type, "thinking")) {
+            const priv = self.private();
+            if (priv.open_think == null) self.beginThinkingBlock();
+            self.appendThinkingText(priv.open_think.?, msg.text orelse "");
         } else if (std.mem.eql(u8, msg.type, "delta")) {
             const priv = self.private();
+            // Reasoning is over; answer text begins.
+            self.closeThinkingBlock();
             if (!priv.ai_turn_open) {
                 priv.ai_turn_open = true;
                 self.appendText("\nai: ");
             }
             self.appendSlice(msg.text orelse "");
         } else if (std.mem.eql(u8, msg.type, "done")) {
+            self.closeThinkingBlock();
             const priv = self.private();
             if (priv.ai_turn_open) {
                 priv.ai_turn_open = false;
                 self.appendText("\n\n");
             }
         } else if (std.mem.eql(u8, msg.type, "error")) {
+            self.closeThinkingBlock();
             const priv = self.private();
             priv.ai_turn_open = false;
             self.appendText("\n[ghostty-ai error] ");
@@ -412,6 +473,108 @@ pub const AiPanel = extern struct {
         }{ .provider = name });
     }
 
+    //---------------------------------------------------------------
+    // Collapsible thinking blocks
+    //---------------------------------------------------------------
+
+    /// Start a new collapsed thinking block: an inline toggle button
+    /// (child anchor) followed by invisible reasoning text.
+    fn beginThinkingBlock(self: *Self) void {
+        const priv = self.private();
+        const buffer = priv.transcript.getBuffer();
+
+        var iter: gtk.TextIter = undefined;
+        buffer.getEndIter(&iter);
+        const anchor = buffer.createChildAnchor(&iter);
+
+        const button = gtk.Button.newWithLabel("▸ thinking");
+        button.as(gtk.Widget).addCssClass("flat");
+        button.as(gtk.Widget).addCssClass("caption");
+        _ = gtk.Button.signals.clicked.connect(
+            button,
+            *Self,
+            onThinkingToggled,
+            self,
+            .{},
+        );
+        priv.transcript.addChildAtAnchor(button.as(gtk.Widget), anchor);
+
+        self.append("\n", null);
+
+        // The body range starts here; the mark tracks it as text
+        // streams in.
+        buffer.getEndIter(&iter);
+        const start = buffer.createMark(null, &iter, 1);
+
+        priv.thinking_blocks.append(alloc(), .{
+            .button = button,
+            .start = start,
+        }) catch return;
+        priv.open_think = priv.thinking_blocks.items.len - 1;
+    }
+
+    fn appendThinkingText(self: *Self, idx: usize, text: []const u8) void {
+        const priv = self.private();
+        if (idx >= priv.thinking_blocks.items.len) return;
+        const blk = &priv.thinking_blocks.items[idx];
+
+        const buffer = priv.transcript.getBuffer();
+        var s: gtk.TextIter = undefined;
+        buffer.getEndIter(&s);
+        const off = s.getOffset();
+
+        // Style tag (italic, dim) always; invisible on top while the
+        // block is collapsed.
+        self.append(text, priv.tag_think);
+        if (blk.hidden) {
+            var e: gtk.TextIter = undefined;
+            buffer.getIterAtOffset(&s, off);
+            buffer.getEndIter(&e);
+            buffer.applyTag(priv.tag_hidden.?, &s, &e);
+        }
+    }
+
+    /// Close the open thinking block, if any. The body stays collapsed
+    /// under its button.
+    fn closeThinkingBlock(self: *Self) void {
+        const priv = self.private();
+        const idx = priv.open_think orelse return;
+        priv.open_think = null;
+        const blk = &priv.thinking_blocks.items[idx];
+
+        const buffer = priv.transcript.getBuffer();
+        var e: gtk.TextIter = undefined;
+        buffer.getEndIter(&e);
+        blk.end = buffer.createMark(null, &e, 0);
+    }
+
+    fn onThinkingToggled(
+        button: *gtk.Button,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        for (priv.thinking_blocks.items) |*blk| {
+            if (blk.button != button) continue;
+
+            const buffer = priv.transcript.getBuffer();
+            var s: gtk.TextIter = undefined;
+            var e: gtk.TextIter = undefined;
+            buffer.getIterAtMark(&s, blk.start);
+            if (blk.end) |m| buffer.getIterAtMark(&e, m) else buffer.getEndIter(&e);
+
+            if (blk.hidden) {
+                buffer.removeTag(priv.tag_hidden.?, &s, &e);
+                blk.hidden = false;
+                button.setLabel("▾ thinking");
+            } else {
+                buffer.applyTag(priv.tag_hidden.?, &s, &e);
+                blk.hidden = true;
+                button.setLabel("▸ thinking");
+            }
+            return;
+        }
+    }
+
     fn disconnect(self: *Self, note: [:0]const u8) void {        const priv = self.private();
         if (priv.fd >= 0) {
             _ = close(priv.fd);
@@ -484,6 +647,34 @@ pub const AiPanel = extern struct {
         transcript.setMonospace(1);
         transcript.setWrapMode(.word_char);
         priv.transcript = transcript;
+        priv.scroller = scroller;
+
+        // Transcript tags. createTag takes (name, property, value)
+        // triples terminated by a null property name; booleans go
+        // through as C ints in the variadic.
+        const buffer = transcript.getBuffer();
+        priv.tag_user = buffer.createTag(
+            "user_bg",
+            "background",
+            "rgba(53,132,228,0.30)",
+            @as(?[*:0]const u8, null),
+        );
+        priv.tag_think = buffer.createTag(
+            "think_style",
+            "style-italic",
+            @as(c_int, 1),
+            "foreground-set",
+            @as(c_int, 1),
+            "foreground",
+            "#9a9a9a",
+            @as(?[*:0]const u8, null),
+        );
+        priv.tag_hidden = buffer.createTag(
+            "think_hidden",
+            "invisible",
+            @as(c_int, 1),
+            @as(?[*:0]const u8, null),
+        );
 
         scroller.setChild(transcript.as(gtk.Widget));
         box.append(scroller.as(gtk.Widget));
@@ -511,9 +702,12 @@ pub const AiPanel = extern struct {
         const text = std.mem.span(entry.as(gtk.Editable).getText());
         if (text.len == 0) return;
 
-        self.appendText("you: ");
-        self.appendSlice(text);
-        self.appendText("\n");
+        // One echo line so the blue background covers the whole
+        // message, prefix included.
+        var w: std.Io.Writer.Allocating = .init(alloc());
+        defer w.deinit();
+        w.writer.print("you: {s}\n", .{text}) catch return;
+        self.append(w.written(), priv.tag_user);
         entry.as(gtk.Editable).setText("");
 
         if (!priv.ai_turn_open) self.sendChat(text);
@@ -556,6 +750,7 @@ pub const AiPanel = extern struct {
         priv.tab_id = null;
         for (priv.provider_names) |n| alloc().free(n);
         priv.provider_names = &.{};
+        priv.thinking_blocks.deinit(alloc());
         priv.read_buf.deinit(alloc());
 
         gobject.Object.virtual_methods.finalize.call(
