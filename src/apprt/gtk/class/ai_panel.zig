@@ -132,6 +132,11 @@ pub const AiPanel = extern struct {
         /// One-shot scroll timer (see scrollSoon).
         scroll_soon: ?c_uint = null,
 
+        /// Connection status light in the header. dot_class tracks the
+        /// css class currently applied so it can be swapped.
+        dot: ?*gtk.Label = null,
+        dot_class: ?[:0]const u8 = null,
+
         /// Multiline prompt input; the scrolled window caps its growth
         /// at about five lines, and the placeholder label covers the
         /// empty state (TextView has no placeholder of its own).
@@ -230,12 +235,17 @@ pub const AiPanel = extern struct {
         if (wpx <= 0) return 80;
         const width: usize = @intCast(wpx);
 
+        // Measure two adjacent cells on the last line. Offsets 0/1 are
+        // not safe: the transcript can legitimately start empty now,
+        // and a leading "\n" would put the two iters on different
+        // lines (advance 0).
         const buffer = priv.transcript.getBuffer();
-        if (buffer.getCharCount() < 2) return 80;
         var ia: gtk.TextIter = undefined;
         var ib: gtk.TextIter = undefined;
-        buffer.getIterAtOffset(&ia, 0);
-        buffer.getIterAtOffset(&ib, 1);
+        _ = buffer.getIterAtLine(&ia, buffer.getLineCount() - 1);
+        ib = ia;
+        if (ib.forwardChars(1) == 0) return 80;
+        if (ib.getLine() != ia.getLine()) return 80;
         var r1: gdk.Rectangle = undefined;
         var r2: gdk.Rectangle = undefined;
         priv.transcript.getIterLocation(&ia, &r1);
@@ -342,7 +352,7 @@ pub const AiPanel = extern struct {
             tab_id: []const u8,
         }{ .tab_id = std.mem.span(tab_id) });
 
-        self.appendText("[ghostty-ai] connected, waiting for daemon…\n");
+        self.setDot("ai-dot-connecting");
         return true;
     }
 
@@ -429,15 +439,7 @@ pub const AiPanel = extern struct {
 
         if (std.mem.eql(u8, msg.type, "ready")) {
             const p = msg.provider orelse "?";
-            const shown = msg.label orelse p;
-            const s = std.fmt.allocPrintSentinel(
-                alloc(),
-                "\n[ghostty-ai] session ready: {s}\n\n",
-                .{shown},
-                0,
-            ) catch return;
-            defer alloc().free(s);
-            self.appendText(s);
+            self.setDot("ai-dot-ready");
             if (msg.message) |warning| {
                 self.appendSlice("\n[ghostty-ai] ");
                 self.appendSlice(warning);
@@ -946,12 +948,22 @@ pub const AiPanel = extern struct {
         return false;
     }
 
+    /// Swap the header connection light's state class.
+    fn setDot(self: *Self, state: [:0]const u8) void {
+        const priv = self.private();
+        const dot = (priv.dot orelse return).as(gtk.Widget);
+        if (priv.dot_class) |old| dot.removeCssClass(old);
+        dot.addCssClass(state);
+        priv.dot_class = state;
+    }
+
     fn disconnect(self: *Self, note: [:0]const u8) void {
         const priv = self.private();
         if (priv.fd >= 0) {
             _ = close(priv.fd);
         }
         priv.fd = -1;
+        self.setDot("ai-dot-off");
         priv.ai_turn_open = false;
         priv.exec_active = false;
         priv.open_think = null;
@@ -980,6 +992,21 @@ pub const AiPanel = extern struct {
 
         const box = self.as(gtk.Box);
         box.as(gtk.Orientable).setOrientation(.vertical);
+
+        // Dot colors. Display-scoped so one provider serves all panels.
+        const css =
+            \\label.ai-dot { font-size: 10px; margin-top: 6px; }
+            \\label.ai-dot-off { color: alpha(currentColor, 0.30); }
+            \\label.ai-dot-connecting { color: #e5b567; }
+            \\label.ai-dot-ready { color: #4ec970; }
+        ;
+        const provider = gtk.CssProvider.new();
+        provider.loadFromData(css.ptr, @intCast(css.len));
+        if (gdk.Display.getDefault()) |display| gtk.StyleContext.addProviderForDisplay(
+            display,
+            provider.as(gtk.StyleProvider),
+            gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
         box.setSpacing(6);
         const w = box.as(gtk.Widget);
         w.setMarginTop(6);
@@ -995,12 +1022,21 @@ pub const AiPanel = extern struct {
             &width_value,
         );
 
-        // Header. The real panel will replace this with model/provider
-        // status for this tab's AI session.
+        // Header: title plus a connection light. Green = session
+        // ready, amber = socket open but no hello reply yet, dim =
+        // disconnected. Replaces the startup chatter lines.
+        const header_row = gtk.Box.new(.horizontal, 6);
         const header = gtk.Label.new("AI Panel");
         header.as(gtk.Widget).addCssClass("title-4");
         header.setXalign(0);
-        box.append(header.as(gtk.Widget));
+        header.as(gtk.Widget).setHexpand(1);
+        const dot = gtk.Label.new("●");
+        dot.as(gtk.Widget).addCssClass("ai-dot");
+        dot.as(gtk.Widget).addCssClass("ai-dot-off");
+        priv.dot = dot;
+        header_row.append(header.as(gtk.Widget));
+        header_row.append(dot.as(gtk.Widget));
+        box.append(header_row.as(gtk.Widget));
 
         // Model picker row: shown once the daemon tells us which
         // providers exist. The choice is per tab.
@@ -1108,7 +1144,6 @@ pub const AiPanel = extern struct {
             .{},
         );
 
-        self.appendText("[ghostty-ai] panel ready\n\n");
     }
 
     /// Send the input buffer as a chat message.
