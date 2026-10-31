@@ -1,5 +1,6 @@
 const std = @import("std");
 const adw = @import("adw");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -11,6 +12,7 @@ const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
+const AiPanel = @import("ai_panel.zig").AiPanel;
 const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
 const SplitTree = @import("split_tree.zig").SplitTree;
@@ -172,6 +174,11 @@ pub const Tab = extern struct {
         // Template bindings
         split_tree: *SplitTree,
 
+        /// The right-docked AI panel and the paned which docks it next
+        /// to the split tree. See initAiPanel.
+        ai_paned: ?*gtk.Paned = null,
+        ai_panel: ?*AiPanel = null,
+
         pub var offset: c_int = 0;
     };
 
@@ -227,6 +234,93 @@ pub const Tab = extern struct {
 
         // Init our actions
         self.initActionMap();
+
+        // Init our right-docked AI panel.
+        self.initAiPanel();
+    }
+
+    /// Build the right-docked AI panel. The tab template parents split_tree
+    /// directly inside the tab box, so we reparent it into a paned with the
+    /// panel as the other child. We do this in code instead of editing the
+    /// blueprint template so that the upstream UI files stay untouched; the
+    /// templates property bindings reference the split_tree object itself,
+    /// so reparenting does not affect them.
+    fn initAiPanel(self: *Self) void {
+        const priv = self.private();
+        const box = self.as(gtk.Box);
+
+        // Reparent the split tree into the paned. We hold a temporary ref
+        // across the remove so the widget survives the unparent.
+        const split_tree = priv.split_tree.as(gtk.Widget);
+        _ = split_tree.ref();
+        box.remove(split_tree);
+
+        const paned = gtk.Paned.new(.horizontal);
+        paned.setResizeStartChild(0);
+        paned.setResizeEndChild(1);
+        paned.setShrinkStartChild(0);
+        paned.setShrinkEndChild(1);
+        paned.setWideHandle(1);
+        paned.setStartChild(split_tree);
+        _ = split_tree.unref();
+
+        // Create the panel but keep it hidden until toggled. GtkPaned hides
+        // the handle when the end child is invisible, so a hidden panel
+        // looks exactly like the stock layout.
+        const panel = AiPanel.new();
+        panel.as(gtk.Widget).setVisible(0);
+        paned.setEndChild(panel.as(gtk.Widget));
+        box.append(paned.as(gtk.Widget));
+
+        priv.ai_paned = paned;
+        priv.ai_panel = panel;
+
+        // Skeleton keybinding: ctrl+alt+i toggles this tab's panel. We hook
+        // it on the tab in the capture phase so it fires before the focused
+        // surface sees the key. This is temporary plumbing until the panel
+        // gets a proper Ghostty keybind action.
+        const ec_key = gtk.EventControllerKey.new();
+        ec_key.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.EventControllerKey.signals.key_pressed.connect(
+            ec_key,
+            *Self,
+            aiPanelKeyPressed,
+            self,
+            .{},
+        );
+        self.as(gtk.Widget).addController(ec_key.as(gtk.EventController));
+    }
+
+    /// Toggle this tabs AI panel visibility.
+    pub fn toggleAiPanel(self: *Self) void {
+        const priv = self.private();
+        const panel = (priv.ai_panel orelse return).as(gtk.Widget);
+        if (panel.getVisible() != 0) {
+            panel.setVisible(0);
+            return;
+        }
+
+        panel.setVisible(1);
+
+        // Give the panel a third of the tab on first show.
+        if (priv.ai_paned) |paned| {
+            const width = paned.as(gtk.Widget).getWidth();
+            if (width > 0) paned.setPosition(@intCast(@divTrunc(width, 3)));
+        }
+    }
+
+    fn aiPanelKeyPressed(
+        _: *gtk.EventControllerKey,
+        keyval: c_uint,
+        _: c_uint,
+        state: gdk.ModifierType,
+        self: *Self,
+    ) callconv(.c) c_int {
+        // ctrl+alt+i
+        if (!state.control_mask or !state.alt_mask) return 0;
+        if (keyval != gdk.KEY_i) return 0;
+        self.toggleAiPanel();
+        return 1;
     }
 
     fn initActionMap(self: *Self) void {
@@ -239,6 +333,7 @@ pub const Tab = extern struct {
             .init("next-page", actionNextPage, null),
             .init("previous-page", actionPreviousPage, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
+            .init("toggle-ai-panel", actionToggleAiPanel, null),
         };
 
         _ = ext.actions.addAsGroup(Self, self, "tab", &actions);
@@ -434,6 +529,14 @@ pub const Tab = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.promptTabTitle();
+    }
+
+    fn actionToggleAiPanel(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.toggleAiPanel();
     }
 
     fn actionRingBell(
