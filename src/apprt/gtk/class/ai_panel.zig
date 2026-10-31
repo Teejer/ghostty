@@ -42,6 +42,13 @@ pub const AiPanel = extern struct {
         .private = .{ .Type = Private, .offset = &Private.offset },
     });
 
+    /// One provider as described by the daemon.
+    const DaemonProvider = struct {
+        name: []const u8 = "",
+        label: []const u8 = "",
+        model: []const u8 = "",
+    };
+
     /// A message received from the daemon.
     const DaemonMsg = struct {
         type: []const u8 = "",
@@ -49,8 +56,9 @@ pub const AiPanel = extern struct {
         message: ?[]const u8 = null,
         state: ?[]const u8 = null,
         provider: ?[]const u8 = null,
+        label: ?[]const u8 = null,
         model: ?[]const u8 = null,
-        providers: [][]const u8 = &.{},
+        providers: []const DaemonProvider = &.{},
     };
 
     const Private = struct {
@@ -287,11 +295,11 @@ pub const AiPanel = extern struct {
 
         if (std.mem.eql(u8, msg.type, "ready")) {
             const p = msg.provider orelse "?";
-            const m = msg.model orelse "?";
+            const shown = msg.label orelse p;
             const s = std.fmt.allocPrintSentinel(
                 alloc(),
-                "\n[ghostty-ai] session ready: {s}/{s}\n\n",
-                .{ p, m },
+                "\n[ghostty-ai] session ready: {s}\n\n",
+                .{shown},
                 0,
             ) catch return;
             defer alloc().free(s);
@@ -327,16 +335,14 @@ pub const AiPanel = extern struct {
     }
 
     /// Rebuild the per-tab model picker from the daemon's provider list,
-    /// selecting the session's current provider.
-    fn rebuildProviders(self: *Self, names: [][]const u8, current: []const u8) void {
+    /// selecting the session's current provider. Dropdown labels are the
+    /// config-provided display names; set_provider still uses the key.
+    fn rebuildProviders(self: *Self, infos: []const DaemonProvider, current: []const u8) void {
         const priv = self.private();
         const a = alloc();
 
         for (priv.provider_names) |n| a.free(n);
-        priv.provider_names = a.alloc([]const u8, names.len) catch return;
-        for (names, 0..) |n, i| {
-            priv.provider_names[i] = a.dupe(u8, n) catch return;
-        }
+        priv.provider_names = a.alloc([]const u8, infos.len) catch return;
 
         // GTK wants a null-terminated array of C strings; it dups them
         // during construction, so our copies must outlive that call and
@@ -344,10 +350,12 @@ pub const AiPanel = extern struct {
         // each iteration's end, before GTK reads them.)
         var strs: std.ArrayList(?[*:0]const u8) = .empty;
         defer strs.deinit(a);
-        for (priv.provider_names) |n| {
-            const z = glib.ext.dupeZ(u8, n);
+        for (infos, 0..) |info, i| {
+            priv.provider_names[i] = a.dupe(u8, info.name) catch return;
+            const display = if (info.label.len > 0) info.label else info.name;
+            const z = glib.ext.dupeZ(u8, display);
             strs.append(a, z.ptr) catch {
-                glib.free(z.ptr);
+                glib.free(@constCast(@ptrCast(z.ptr)));
                 return;
             };
         }
