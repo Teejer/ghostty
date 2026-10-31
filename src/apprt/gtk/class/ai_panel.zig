@@ -338,15 +338,24 @@ pub const AiPanel = extern struct {
             priv.provider_names[i] = a.dupe(u8, n) catch return;
         }
 
-        // GTK wants a null-terminated array of C strings; it dups them.
+        // GTK wants a null-terminated array of C strings; it dups them
+        // during construction, so our copies must outlive that call and
+        // only then be freed. (A `defer` inside the loop would free at
+        // each iteration's end, before GTK reads them.)
         var strs: std.ArrayList(?[*:0]const u8) = .empty;
         defer strs.deinit(a);
         for (priv.provider_names) |n| {
             const z = glib.ext.dupeZ(u8, n);
-            strs.append(a, z.ptr) catch {};
-            defer glib.free(z.ptr);
+            strs.append(a, z.ptr) catch {
+                glib.free(z.ptr);
+                return;
+            };
         }
-        strs.append(a, null) catch return;
+        strs.append(a, null) catch {
+            for (strs.items) |maybe| if (maybe) |pp| glib.free(@constCast(@ptrCast(pp)));
+            return;
+        };
+        defer for (strs.items) |maybe| if (maybe) |pp| glib.free(@constCast(@ptrCast(pp)));
 
         // Replace the old dropdown, if any.
         if (priv.provider_drop) |old| {
