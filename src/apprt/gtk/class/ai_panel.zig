@@ -487,15 +487,7 @@ pub const AiPanel = extern struct {
             } else {
                 self.closeThinkingBlock();
                 self.private().ai_turn_open = false;
-                const ask = std.fmt.allocPrintSentinel(
-                    alloc(),
-                    "Run: {s}",
-                    .{cmd},
-                    0,
-                ) catch return;
-                defer alloc().free(ask);
-                self.appendExecBar(ask);
-                self.appendExecButtons(id, cmd);
+                self.appendExecProposal(id, cmd);
             }
         } else if (std.mem.eql(u8, msg.type, "exec_cancel")) {
             self.clearExecProposal();
@@ -564,7 +556,15 @@ pub const AiPanel = extern struct {
         priv.provider_drop = drop;
 
         if (priv.provider_row) |row| {
+            // Insert before the light so a provider switch (which
+            // rebuilds the dropdown but not the light) keeps the row
+            // order [label, dropdown, light].
             row.append(drop.as(gtk.Widget));
+            if (priv.prov_dot) |pd|
+                row.reorderChildAfter(
+                    pd.as(gtk.Widget),
+                    drop.as(gtk.Widget),
+                );
 
             // Engine light beside the picker: green when the daemon
             // can reach this endpoint, dim when it cannot.
@@ -726,7 +726,10 @@ pub const AiPanel = extern struct {
     //---------------------------------------------------------------
 
     /// Inline Run/Deny buttons under a command proposal.
-    fn appendExecButtons(self: *Self, id: []const u8, cmd: []const u8) void {
+    /// One amber pill: the proposed command and its Approve/Deny
+    /// buttons share a single rounded background (separate bars for
+    /// text and buttons read as two misaligned boxes).
+    fn appendExecProposal(self: *Self, id: []const u8, cmd: []const u8) void {
         const priv = self.private();
         const a = alloc();
         self.clearExecProposal();
@@ -737,9 +740,24 @@ pub const AiPanel = extern struct {
         const anchor = buffer.createChildAnchor(&iter);
         self.append("\n", null);
 
-        const box = gtk.Box.new(.horizontal, 6);
-        box.as(gtk.Widget).addCssClass("ai-exec");
-        const run = gtk.Button.newWithLabel("Run");
+        const outer = gtk.Box.new(.vertical, 4);
+        outer.as(gtk.Widget).addCssClass("ai-exec");
+
+        const text = std.fmt.allocPrintSentinel(
+            a,
+            "Run: {s}",
+            .{cmd},
+            0,
+        ) catch return;
+        defer a.free(text);
+        const label = gtk.Label.new(text);
+        label.setXalign(0);
+        label.setWrap(1);
+        label.setSelectable(1);
+        outer.append(label.as(gtk.Widget));
+
+        const buttons = gtk.Box.new(.horizontal, 6);
+        const run = gtk.Button.newWithLabel("Approve");
         run.as(gtk.Widget).addCssClass("suggested-action");
         const deny = gtk.Button.newWithLabel("Deny");
         deny.as(gtk.Widget).addCssClass("flat");
@@ -757,9 +775,21 @@ pub const AiPanel = extern struct {
             self,
             .{},
         );
-        box.append(run.as(gtk.Widget));
-        box.append(deny.as(gtk.Widget));
-        priv.transcript.addChildAtAnchor(box.as(gtk.Widget), anchor);
+        buttons.append(run.as(gtk.Widget));
+        buttons.append(deny.as(gtk.Widget));
+        outer.append(buttons.as(gtk.Widget));
+
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) {
+            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+            defer wr_value.unset();
+            gobject.Object.setProperty(
+                outer.as(gobject.Object),
+                "width-request",
+                &wr_value,
+            );
+        }
+        priv.transcript.addChildAtAnchor(outer.as(gtk.Widget), anchor);
 
         priv.exec_id = a.dupe(u8, id) catch return;
         priv.exec_cmd = a.dupe(u8, cmd) catch return;
@@ -1166,7 +1196,7 @@ pub const AiPanel = extern struct {
             \\.ai-exec {
             \\    background: rgba(229,181,103,0.22);
             \\    border-radius: 8px;
-            \\    padding: 2px 8px;
+            \\    padding: 4px 8px;
             \\}
         ;
         const provider = gtk.CssProvider.new();
