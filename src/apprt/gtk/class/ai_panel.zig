@@ -140,7 +140,7 @@ pub const AiPanel = extern struct {
 
     /// Connect to the daemon if not already connected and register this
     /// tab's session. Errors are reported into the transcript.
-    fn ensureConnected(self: *Self) bool {
+    pub fn ensureConnected(self: *Self) bool {
         const priv = self.private();
         if (priv.fd >= 0) return true;
 
@@ -220,8 +220,9 @@ pub const AiPanel = extern struct {
         while (left.len > 0) {
             const n = write(priv.fd, @ptrCast(left.ptr), left.len);
             if (n < 0) {
-                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
-                log.warn("daemon write failed fd={d}", .{priv.fd});
+                const e = std.c._errno().*;
+                if (e == @intFromEnum(std.c.E.INTR)) continue;
+                log.warn("daemon write failed fd={d} errno={d}", .{ priv.fd, e });
                 return; // EAGAIN or error: drop (MVP)
             }
             left = left[@intCast(n)..];
@@ -414,6 +415,12 @@ pub const AiPanel = extern struct {
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         const priv = self.private();
+
+        // GLib zero-initializes the private area; Zig field defaults are
+        // not applied there. A zeroed fd would look like an open socket
+        // (fd 0 is stdin), so disconnected must be set explicitly.
+        priv.fd = -1;
+
         priv.tab_id = glib.uuidStringRandom();
 
         const box = self.as(gtk.Box);

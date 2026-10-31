@@ -311,6 +311,12 @@ pub const Tab = extern struct {
 
         panel.setVisible(1);
 
+        // Connect on show so the model picker and connection state
+        // appear without requiring a first message.
+        if (priv.ai_panel) |panel_obj| {
+            _ = panel_obj.ensureConnected();
+        }
+
         // On first show, give the panel a third of the tab (position is
         // the width of the start child, i.e. the terminal).
         if (priv.ai_paned) |paned| {
