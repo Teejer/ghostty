@@ -132,6 +132,14 @@ pub const AiPanel = extern struct {
         /// One-shot scroll timer (see scrollSoon).
         scroll_soon: ?c_uint = null,
 
+        /// Multiline prompt input; the scrolled window caps its growth
+        /// at about five lines, and the placeholder label covers the
+        /// empty state (TextView has no placeholder of its own).
+        input_view: ?*gtk.TextView = null,
+        input_scroll: ?*gtk.ScrolledWindow = null,
+        input_placeholder: ?*gtk.Label = null,
+        input_line_h: c_int = 0,
+
         /// Per-tab model picker. The provider list comes from the
         /// daemon and applies to this tab's session only.
         provider_row: ?*gtk.Box = null,
@@ -1046,48 +1054,134 @@ pub const AiPanel = extern struct {
         scroller.setChild(transcript.as(gtk.Widget));
         box.append(scroller.as(gtk.Widget));
 
-        // Prompt entry.
-        const entry = gtk.Entry.new();
-        entry.setPlaceholderText("Ask the AI about this tab…");
-        _ = gtk.Entry.signals.activate.connect(
-            entry,
+        // Prompt input: a small multiline text view. It grows with its
+        // content (propagate-natural-height) up to about five lines and
+        // then scrolls, so the text you are typing stays visible even
+        // when the panel is narrow: the caret keeps its position and
+        // earlier text scrolls sideways as you move back over it.
+        // Enter sends; Shift+Enter inserts a newline.
+        const input_scroll: *gtk.ScrolledWindow = .new();
+        input_scroll.setPolicy(.never, .never);
+        input_scroll.setPropagateNaturalHeight(1);
+        input_scroll.setMinContentHeight(34);
+        input_scroll.setMaxContentHeight(130);
+
+        const input = gtk.TextView.new();
+        input.setWrapMode(.word_char);
+        priv.input_view = input;
+        priv.input_scroll = input_scroll;
+
+        // Placeholder: TextView has none, so lay a dim label over the
+        // empty view and hide it whenever there is text.
+        const overlay = gtk.Overlay.new();
+        const placeholder = gtk.Label.new("Ask the AI about this tab…");
+        placeholder.setXalign(0);
+        placeholder.as(gtk.Widget).addCssClass("dim-label");
+        placeholder.as(gtk.Widget).setCanTarget(0);
+        placeholder.as(gtk.Widget).setMarginStart(6);
+        placeholder.as(gtk.Widget).setMarginTop(8);
+        priv.input_placeholder = placeholder;
+        overlay.addOverlay(placeholder.as(gtk.Widget));
+
+        overlay.setChild(input_scroll.as(gtk.Widget));
+        input_scroll.setChild(input.as(gtk.Widget));
+        box.append(overlay.as(gtk.Widget));
+
+        const ec_in = gtk.EventControllerKey.new();
+        _ = gtk.EventControllerKey.signals.key_pressed.connect(
+            ec_in,
             *Self,
-            onEntryActivate,
+            onInputKeyPressed,
             self,
             .{},
         );
-        box.append(entry.as(gtk.Widget));
+        input.as(gtk.Widget).addController(ec_in.as(gtk.EventController));
+
+        // TextBuffer.signals.changed is missing from the bindings'
+        // connect structs, so attach it by name.
+        _ = gobject.signalConnectData(
+            input.getBuffer().as(gobject.Object),
+            "changed",
+            @ptrCast(&onInputChanged),
+            self,
+            null,
+            .{},
+        );
 
         self.appendText("[ghostty-ai] panel ready\n\n");
     }
 
-    fn onEntryActivate(
-        entry: *gtk.Entry,
-        self: *Self,
-    ) callconv(.c) void {
+    /// Send the input buffer as a chat message.
+    fn sendInput(self: *Self) void {
         const priv = self.private();
-
-        // getText() borrows the entry's buffer; own our copy before
-        // anything reallocates it (clearing the entry or the echo's
-        // allocations would otherwise leave `text` dangling).
-        const text = std.mem.span(entry.as(gtk.Editable).getText());
+        const view = priv.input_view orelse return;
+        const buffer = view.getBuffer();
+        var s: gtk.TextIter = undefined;
+        var e: gtk.TextIter = undefined;
+        buffer.getBounds(&s, &e);
+        const raw = buffer.getText(&s, &e, 0);
+        defer glib.free(raw);
+        const text = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
         if (text.len == 0) return;
         const owned = glib.ext.dupeZ(u8, text);
         defer glib.free(owned.ptr);
+        buffer.setText("", -1);
 
-        // A blank line before, then the message padded out to the full
+        // Echo with a blank line before, padded out to the full
         // transcript width so the blue reads as a bar, edge to edge.
-        const buffer = priv.transcript.getBuffer();
+        const tbuf = priv.transcript.getBuffer();
         var it: gtk.TextIter = undefined;
         self.append("\n", null);
-        buffer.getEndIter(&it);
+        tbuf.getEndIter(&it);
         const start_off: usize = @intCast(it.getOffset());
         self.append(owned, priv.tag_user);
         self.padTaggedLine(start_off);
         self.append("\n", priv.tag_user);
-        entry.as(gtk.Editable).setText("");
 
         if (!priv.ai_turn_open) self.sendChat(owned);
+    }
+
+    /// Enter sends the message; Shift+Enter writes a newline.
+    fn onInputKeyPressed(
+        _: *gtk.EventControllerKey,
+        keyval: c_uint,
+        _: c_uint,
+        state: gdk.ModifierType,
+        self: *Self,
+    ) callconv(.c) c_int {
+        if (keyval != gdk.KEY_Return and keyval != gdk.KEY_KP_Enter) return 0;
+        if (state.shift_mask) return 0;
+        self.sendInput();
+        return 1;
+    }
+
+    /// Keeps the placeholder in step with the buffer and sizes the
+    /// growth cap to exactly five lines of the real font once the text
+    /// view has a layout.
+    fn onInputChanged(_: *anyopaque, ud: ?*anyopaque) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(ud));
+        const priv = self.private();
+        const view = priv.input_view orelse return;
+        const buffer = view.getBuffer();
+
+        const empty = buffer.getCharCount() <= 0;
+        if (priv.input_placeholder) |ph|
+            ph.as(gtk.Widget).setVisible(@intFromBool(empty));
+
+        if (priv.input_line_h <= 0) {
+            var it: gtk.TextIter = undefined;
+            _ = buffer.getIterAtLine(&it, 0);
+            var y: c_int = 0;
+            var h: c_int = 0;
+            view.getLineYrange(&it, &y, &h);
+            if (h > 0) {
+                priv.input_line_h = h;
+                if (priv.input_scroll) |sc| {
+                    sc.setMinContentHeight(h + 12);
+                    sc.setMaxContentHeight(h * 5 + 12);
+                }
+            }
+        }
     }
 
     fn sendChat(self: *Self, text: []const u8) void {
