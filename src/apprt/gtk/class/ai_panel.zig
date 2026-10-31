@@ -704,9 +704,10 @@ pub const AiPanel = extern struct {
 
         // One echo line so the blue background covers the whole
         // message, prefix included.
+        // The blue background identifies our messages; no prefix.
         var w: std.Io.Writer.Allocating = .init(alloc());
         defer w.deinit();
-        w.writer.print("you: {s}\n", .{text}) catch return;
+        w.writer.print("{s}\n", .{text}) catch return;
         self.append(w.written(), priv.tag_user);
         entry.as(gtk.Editable).setText("");
 
