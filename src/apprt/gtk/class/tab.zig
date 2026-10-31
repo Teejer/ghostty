@@ -179,6 +179,11 @@ pub const Tab = extern struct {
         ai_paned: ?*gtk.Paned = null,
         ai_panel: ?*AiPanel = null,
 
+        /// True once the AI panel has been shown and given its initial
+        /// position. We only set the position on first show so that we
+        /// do not clobber a manual resize when toggling the panel.
+        ai_panel_positioned: bool = false,
+
         pub var offset: c_int = 0;
     };
 
@@ -302,10 +307,16 @@ pub const Tab = extern struct {
 
         panel.setVisible(1);
 
-        // Give the panel a third of the tab on first show.
+        // On first show, give the panel a third of the tab (position is
+        // the width of the start child, i.e. the terminal).
         if (priv.ai_paned) |paned| {
-            const width = paned.as(gtk.Widget).getWidth();
-            if (width > 0) paned.setPosition(@intCast(@divTrunc(width, 3)));
+            if (!priv.ai_panel_positioned) {
+                const width = paned.as(gtk.Widget).getWidth();
+                if (width > 0) {
+                    priv.ai_panel_positioned = true;
+                    paned.setPosition(@intCast(@divTrunc(width * 2, 3)));
+                }
+            }
         }
     }
 
