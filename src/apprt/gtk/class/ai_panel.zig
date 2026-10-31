@@ -463,6 +463,7 @@ pub const AiPanel = extern struct {
         } else if (std.mem.eql(u8, msg.type, "exec")) {
             const cmd = msg.command orelse "";
             const id = msg.id orelse "";
+            log.debug("exec proposal id={s} auto={?} cmd={s}", .{ id, msg.auto, cmd });
             if (msg.auto orelse false) {
                 const auto_note = std.fmt.allocPrintSentinel(
                     alloc(),
@@ -772,6 +773,7 @@ pub const AiPanel = extern struct {
             self.execReply(id, "failed", "");
             return;
         };
+        log.debug("exec approved, injecting id={s}", .{id});
         if (!tab.injectText(w.written())) {
             self.appendText("[exec failed: no active surface]\n");
             self.execReply(id, "failed", "");
@@ -841,6 +843,7 @@ pub const AiPanel = extern struct {
         const id = priv.exec_id orelse return;
         // The screen tail is what just ran: command, output, prompt.
         const from = if (output.len > 8192) output.len - 8192 else 0;
+        log.debug("exec finished status={s} output_bytes={}", .{ status, output.len });
         self.execReply(id, status, output[from..]);
         if (std.mem.eql(u8, status, "timeout")) {
             self.appendText("[exec] still running; sent the model the output so far\n");
@@ -1004,7 +1007,7 @@ pub const AiPanel = extern struct {
         );
         priv.tag_think = buffer.createTag(
             "think_style",
-            "style-italic",
+            "italic",
             @as(c_int, 1),
             "foreground-set",
             @as(c_int, 1),
