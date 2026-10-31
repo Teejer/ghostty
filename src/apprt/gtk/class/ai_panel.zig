@@ -22,6 +22,7 @@ extern fn fcntl(fd: c_int, cmd: c_int, ...) callconv(.c) c_int;
 const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
+const gdk = @import("gdk");
 
 const Common = @import("../class.zig").Common;
 
@@ -59,6 +60,9 @@ pub const AiPanel = extern struct {
         label: ?[]const u8 = null,
         model: ?[]const u8 = null,
         providers: []const DaemonProvider = &.{},
+        id: ?[]const u8 = null,
+        command: ?[]const u8 = null,
+        auto: ?bool = null,
     };
 
     const Private = struct {
@@ -110,6 +114,20 @@ pub const AiPanel = extern struct {
         /// currently receiving reasoning deltas, if any.
         thinking_blocks: std.ArrayList(ThinkingBlock) = .empty,
         open_think: ?usize = null,
+
+        /// AI-proposed command awaiting this tab's decision (Run/Deny
+        /// buttons) or running with output capture (exec_active).
+        exec_id: ?[]u8 = null,
+        exec_cmd: ?[]u8 = null,
+        exec_run_btn: ?*gtk.Button = null,
+        exec_deny_btn: ?*gtk.Button = null,
+        exec_active: bool = false,
+        exec_interactive: bool = false,
+        exec_before: ?[]u8 = null,
+        exec_last: ?[]u8 = null,
+        exec_elapsed_ms: u32 = 0,
+        exec_stable_ms: u32 = 0,
+        exec_tick: u32 = 0,
 
         /// Per-tab model picker. The provider list comes from the
         /// daemon and applies to this tab's session only.
@@ -165,6 +183,57 @@ pub const AiPanel = extern struct {
         const page = adj.getPageSize();
         const value = adj.getValue();
         if (upper - page - value < 64) adj.setValue(upper);
+    }
+
+    /// Pad the text inserted since start_off with spaces (tagged like
+    /// the text) so its background spans the full transcript width.
+    /// The transcript is monospace, so two adjacent cells give us the
+    /// glyph advance and thus the visible column count. Wrapped lines
+    /// are handled by filling to a multiple of the column count.
+    /// Padding is computed at write time: after a window resize, older
+    /// bars keep their old width.
+    fn padTaggedLine(self: *Self, start_off: usize) void {
+        const priv = self.private();
+        const buffer = priv.transcript.getBuffer();
+        var e: gtk.TextIter = undefined;
+        buffer.getEndIter(&e);
+        const end_off: usize = @intCast(e.getOffset());
+        const len = end_off -| start_off;
+        const cols = self.transcriptCols();
+
+        var pad = cols - (len % cols);
+        if (pad == cols) pad = 0; // exactly full
+        if (pad == 0 or pad > 4096) return;
+
+        const spaces = alloc().alloc(u8, pad) catch return;
+        defer alloc().free(spaces);
+        @memset(spaces, ' ');
+        self.append(spaces, priv.tag_user);
+    }
+
+    /// Approximate number of monospace columns visible in the
+    /// transcript view.
+    fn transcriptCols(self: *Self) usize {
+        const priv = self.private();
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx <= 0) return 80;
+        const width: usize = @intCast(wpx);
+
+        const buffer = priv.transcript.getBuffer();
+        if (buffer.getCharCount() < 2) return 80;
+        var ia: gtk.TextIter = undefined;
+        var ib: gtk.TextIter = undefined;
+        buffer.getIterAtOffset(&ia, 0);
+        buffer.getIterAtOffset(&ib, 1);
+        var r1: gdk.Rectangle = undefined;
+        var r2: gdk.Rectangle = undefined;
+        priv.transcript.getIterLocation(&ia, &r1);
+        priv.transcript.getIterLocation(&ib, &r2);
+        const advance: isize = r2.f_x - r1.f_x;
+        if (advance <= 0) return 80;
+
+        const usable: usize = if (width > 16) width - 16 else 2;
+        return @max(usable / @as(usize, @intCast(advance)), 20);
     }
 
     /// Append text to the chat transcript.
@@ -318,6 +387,7 @@ pub const AiPanel = extern struct {
                 return 0;
             }
         }
+        if (priv.exec_active) self.execPollTick();
         return 1;
     }
 
@@ -381,7 +451,7 @@ pub const AiPanel = extern struct {
             const priv = self.private();
             if (priv.ai_turn_open) {
                 priv.ai_turn_open = false;
-                self.appendText("\n\n");
+                self.appendText("\n");
             }
         } else if (std.mem.eql(u8, msg.type, "error")) {
             self.closeThinkingBlock();
@@ -390,6 +460,29 @@ pub const AiPanel = extern struct {
             self.appendText("\n[ghostty-ai error] ");
             self.appendSlice(msg.message orelse "unknown error");
             self.appendText("\n\n");
+        } else if (std.mem.eql(u8, msg.type, "exec")) {
+            const cmd = msg.command orelse "";
+            const id = msg.id orelse "";
+            if (msg.auto orelse false) {
+                const auto_note = std.fmt.allocPrintSentinel(
+                    alloc(),
+                    "\n[exec] auto-running: {s}\n",
+                    .{cmd},
+                    0,
+                ) catch return;
+                defer alloc().free(auto_note);
+                self.appendText(auto_note);
+                self.startExec(id, cmd);
+            } else {
+                self.closeThinkingBlock();
+                self.private().ai_turn_open = false;
+                self.appendText("\n[exec] The AI wants to run this in your tab:\n");
+                self.appendSlice(cmd);
+                self.appendText("\n");
+                self.appendExecButtons(id, cmd);
+            }
+        } else if (std.mem.eql(u8, msg.type, "exec_cancel")) {
+            self.clearExecProposal();
         } else if (std.mem.eql(u8, msg.type, "status")) {
             // No UI for turn states yet.
         }
@@ -575,12 +668,262 @@ pub const AiPanel = extern struct {
         }
     }
 
-    fn disconnect(self: *Self, note: [:0]const u8) void {        const priv = self.private();
+    //---------------------------------------------------------------
+    // Command approval and execution (the pty gate)
+    //
+    // Nothing reaches the terminal except through a click on these
+    // buttons, into this tab's own surface. A compromised daemon can
+    // propose; only the terminal can execute.
+    //---------------------------------------------------------------
+
+    /// Inline Run/Deny buttons under a command proposal.
+    fn appendExecButtons(self: *Self, id: []const u8, cmd: []const u8) void {
+        const priv = self.private();
+        const a = alloc();
+        self.clearExecProposal();
+
+        const buffer = priv.transcript.getBuffer();
+        var iter: gtk.TextIter = undefined;
+        buffer.getEndIter(&iter);
+        const anchor = buffer.createChildAnchor(&iter);
+        self.append("\n", null);
+
+        const box = gtk.Box.new(.horizontal, 6);
+        const run = gtk.Button.newWithLabel("Run");
+        run.as(gtk.Widget).addCssClass("suggested-action");
+        const deny = gtk.Button.newWithLabel("Deny");
+        deny.as(gtk.Widget).addCssClass("flat");
+        _ = gtk.Button.signals.clicked.connect(
+            run,
+            *Self,
+            onExecRunClicked,
+            self,
+            .{},
+        );
+        _ = gtk.Button.signals.clicked.connect(
+            deny,
+            *Self,
+            onExecDenyClicked,
+            self,
+            .{},
+        );
+        box.append(run.as(gtk.Widget));
+        box.append(deny.as(gtk.Widget));
+        priv.transcript.addChildAtAnchor(box.as(gtk.Widget), anchor);
+
+        priv.exec_id = a.dupe(u8, id) catch return;
+        priv.exec_cmd = a.dupe(u8, cmd) catch return;
+        priv.exec_run_btn = run;
+        priv.exec_deny_btn = deny;
+    }
+
+    fn onExecRunClicked(
+        button: *gtk.Button,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const btn = priv.exec_run_btn orelse return;
+        if (btn != button or priv.exec_active) return;
+        const id = priv.exec_id orelse return;
+        const cmd = priv.exec_cmd orelse return;
+        button.as(gtk.Widget).setSensitive(0);
+        if (priv.exec_deny_btn) |d| d.as(gtk.Widget).setSensitive(0);
+        self.startExec(id, cmd);
+    }
+
+    fn onExecDenyClicked(
+        button: *gtk.Button,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const btn = priv.exec_deny_btn orelse return;
+        if (btn != button or priv.exec_active) return;
+        const id = priv.exec_id orelse return;
+        button.as(gtk.Widget).setSensitive(0);
+        if (priv.exec_run_btn) |r| r.as(gtk.Widget).setSensitive(0);
+        self.sendJson(struct {
+            type: []const u8 = "exec_reply",
+            id: []const u8,
+            decision: []const u8 = "deny",
+        }{ .id = id });
+        self.appendText("[denied]\n");
+        self.clearExecStrings();
+    }
+
+    /// Approved: write the command into our own tab's pty and start
+    /// watching the screen for output.
+    fn startExec(self: *Self, id: []const u8, cmd: []const u8) void {
+        const priv = self.private();
+        const a = alloc();
+
+        // Escape for the core's config-string parser (the same one the
+        // write: keybinding uses): double backslashes; the trailing
+        // two-character \n decodes to Enter.
+        var w: std.Io.Writer.Allocating = .init(a);
+        defer w.deinit();
+        for (cmd) |ch| {
+            if (ch == '\\') {
+                w.writer.writeAll("\\\\") catch return;
+            } else w.writer.writeByte(ch) catch return;
+        }
+        w.writer.writeAll("\\n") catch return;
+
+        const tab = priv.tab orelse {
+            self.execReply(id, "failed", "");
+            return;
+        };
+        if (!tab.injectText(w.written())) {
+            self.appendText("[exec failed: no active surface]\n");
+            self.execReply(id, "failed", "");
+            return;
+        }
+
+        // Snapshot the screen so we can tell when output settles.
+        if (priv.exec_before) |v| a.free(v);
+        priv.exec_before = null;
+        if (tab.dumpActiveSurfaceText(a)) |before| {
+            priv.exec_before = @constCast(before);
+        } else |_| {}
+
+        priv.exec_active = true;
+        priv.exec_interactive = isInteractiveCommand(cmd);
+        priv.exec_elapsed_ms = 0;
+        priv.exec_stable_ms = 0;
+        priv.exec_tick = 0;
+        if (priv.exec_last) |v| a.free(v);
+        priv.exec_last = null;
+    }
+
+    /// Driven from the socket poll at ~300ms cadence. Done when two
+    /// consecutive screen dumps match; timeouts keep long-running and
+    /// interactive commands from parking the turn.
+    fn execPollTick(self: *Self) void {
+        const priv = self.private();
+        const a = alloc();
+        priv.exec_tick += 1;
+        if (priv.exec_tick % 6 != 0) return;
+        priv.exec_elapsed_ms += 300;
+
+        const tab = priv.tab orelse {
+            self.finishExec("failed", "");
+            return;
+        };
+        const after = tab.dumpActiveSurfaceText(a) catch {
+            self.finishExec("failed", "");
+            return;
+        };
+        defer a.free(after);
+
+        const stable = priv.exec_last != null and
+            std.mem.eql(u8, priv.exec_last.?, after);
+        if (stable) {
+            priv.exec_stable_ms += 300;
+        } else {
+            priv.exec_stable_ms = 0;
+            if (priv.exec_last) |v| a.free(v);
+            priv.exec_last = a.dupe(u8, after) catch null;
+        }
+
+        const settle_ms: u32 = if (priv.exec_interactive) 700 else 900;
+        const timeout_ms: u32 = if (priv.exec_interactive) 4_000 else 30_000;
+        if (priv.exec_stable_ms >= settle_ms) {
+            self.finishExec("done", after);
+        } else if (priv.exec_elapsed_ms >= timeout_ms) {
+            self.finishExec(
+                if (priv.exec_interactive) "interactive" else "timeout",
+                after,
+            );
+        }
+    }
+
+    fn finishExec(self: *Self, status: []const u8, output: []const u8) void {
+        const priv = self.private();
+        const id = priv.exec_id orelse return;
+        // The screen tail is what just ran: command, output, prompt.
+        const from = if (output.len > 8192) output.len - 8192 else 0;
+        self.execReply(id, status, output[from..]);
+        if (std.mem.eql(u8, status, "timeout")) {
+            self.appendText("[exec] still running; sent the model the output so far\n");
+        } else if (std.mem.eql(u8, status, "interactive")) {
+            self.appendText("[exec] looks interactive; sent partial output, will not drive it\n");
+        }
+        priv.exec_active = false;
+        self.clearExecStrings();
+    }
+
+    fn execReply(
+        self: *Self,
+        id: []const u8,
+        status: []const u8,
+        output: []const u8,
+    ) void {
+        self.sendJson(struct {
+            type: []const u8 = "exec_reply",
+            id: []const u8,
+            decision: []const u8 = "approve",
+            status: []const u8,
+            output: []const u8,
+        }{ .id = id, .status = status, .output = output });
+    }
+
+    fn clearExecStrings(self: *Self) void {
+        const priv = self.private();
+        const a = alloc();
+        if (priv.exec_id) |v| a.free(v);
+        if (priv.exec_cmd) |v| a.free(v);
+        if (priv.exec_before) |v| a.free(v);
+        if (priv.exec_last) |v| a.free(v);
+        priv.exec_id = null;
+        priv.exec_cmd = null;
+        priv.exec_before = null;
+        priv.exec_last = null;
+        priv.exec_run_btn = null;
+        priv.exec_deny_btn = null;
+    }
+
+    /// The daemon withdrew a proposal (its turn was replaced): disarm
+    /// the buttons. A running command is unaffected.
+    fn clearExecProposal(self: *Self) void {
+        const priv = self.private();
+        if (priv.exec_active) return;
+        if (priv.exec_run_btn) |b| b.as(gtk.Widget).setSensitive(0);
+        if (priv.exec_deny_btn) |b| b.as(gtk.Widget).setSensitive(0);
+        priv.exec_run_btn = null;
+        priv.exec_deny_btn = null;
+        if (priv.exec_id) |v| alloc().free(v);
+        if (priv.exec_cmd) |v| alloc().free(v);
+        priv.exec_id = null;
+        priv.exec_cmd = null;
+    }
+
+    /// Commands that grab the terminal; we never wait long on them and
+    /// never feed them input.
+    fn isInteractiveCommand(cmd: []const u8) bool {
+        var it = std.mem.tokenizeScalar(u8, cmd, ' ');
+        const first = it.next() orelse return false;
+        const base = std.fs.path.basename(first);
+        const tuis = [_][]const u8{
+            "vim",   "vi",     "nvim",     "emacs",  "nano",  "joe",
+            "ssh",   "telnet", "top",      "htop",   "btop",  "less",
+            "more",  "man",    "gdb",      "lldb",   "python", "python3",
+            "node",  "irb",    "mysql",    "psql",   "sqlite3", "tmux",
+            "screen", "ftp",   "lynx",     "elinks", "mutt",  "alsamixer",
+            "nmtui",
+        };
+        for (tuis) |t| if (std.mem.eql(u8, base, t)) return true;
+        return false;
+    }
+
+    fn disconnect(self: *Self, note: [:0]const u8) void {
+        const priv = self.private();
         if (priv.fd >= 0) {
             _ = close(priv.fd);
         }
         priv.fd = -1;
         priv.ai_turn_open = false;
+        priv.exec_active = false;
+        priv.open_think = null;
+        self.clearExecStrings();
         priv.read_buf.clearRetainingCapacity();
         if (priv.poll_source) |source_id| {
             _ = glib.Source.remove(source_id);
@@ -704,11 +1047,16 @@ pub const AiPanel = extern struct {
 
         // One echo line so the blue background covers the whole
         // message, prefix included.
-        // The blue background identifies our messages; no prefix.
-        var w: std.Io.Writer.Allocating = .init(alloc());
-        defer w.deinit();
-        w.writer.print("{s}\n", .{text}) catch return;
-        self.append(w.written(), priv.tag_user);
+        // A blank line before, then the message padded out to the full
+        // transcript width so the blue reads as a bar, edge to edge.
+        const buffer = priv.transcript.getBuffer();
+        var it: gtk.TextIter = undefined;
+        self.append("\n", null);
+        buffer.getEndIter(&it);
+        const start_off: usize = @intCast(it.getOffset());
+        self.append(text, priv.tag_user);
+        self.padTaggedLine(start_off);
+        self.append("\n", priv.tag_user);
         entry.as(gtk.Editable).setText("");
 
         if (!priv.ai_turn_open) self.sendChat(text);

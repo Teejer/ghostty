@@ -354,6 +354,21 @@ pub const Tab = extern struct {
             .dumpStringAlloc(alloc, .{ .active = .{} });
     }
 
+    /// Inject raw text into the active surface's pty, exactly what the
+    /// "write" keybinding action does (no bracketed paste). The AI
+    /// panel may only call this after the user approved the command;
+    /// the text must be escaped the way config "write:" strings are
+    /// (backslashes doubled, "\n" for Enter).
+    pub fn injectText(self: *Self, text: []const u8) bool {
+        const gtk_surface = (self.getActiveSurface()) orelse return false;
+        const core = gtk_surface.core() orelse return false;
+        _ = core.performBindingAction(.{ .text = text }) catch |err| {
+            log.warn("ai inject text failed err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     fn aiPanelKeyPressed(
         _: *gtk.EventControllerKey,
         keyval: c_uint,
