@@ -1097,7 +1097,12 @@ pub const AiPanel = extern struct {
         // earlier text scrolls sideways as you move back over it.
         // Enter sends; Shift+Enter inserts a newline.
         const input_scroll: *gtk.ScrolledWindow = .new();
-        input_scroll.setPolicy(.never, .never);
+        // Vertical policy must be automatic: with .never the scroller
+        // ignores propagate-natural-height and the min/max caps and
+        // requests the whole content height, pushing the input past
+        // the window bottom. Horizontal stays never because the view
+        // word-wraps instead.
+        input_scroll.setPolicy(.never, .automatic);
         input_scroll.setPropagateNaturalHeight(1);
         input_scroll.setMinContentHeight(34);
         input_scroll.setMaxContentHeight(130);
