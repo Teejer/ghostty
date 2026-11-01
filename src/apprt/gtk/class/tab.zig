@@ -279,6 +279,22 @@ pub const Tab = extern struct {
         paned.setStartChild(split_tree);
         _ = split_tree.unref();
 
+        // Floor the terminal side at ~40 columns. bash redraws its
+        // prompt at every SIGWINCH, and once the prompt wraps (pane
+        // narrower than the prompt) the redraws pile up as partial
+        // prompt fragments in scrollback — reproducible in stock
+        // ghostty with splits, so it is shell behavior, but the
+        // divider should never let a surface get that small.
+        // setShrinkStartChild(0) then keeps the paned honest about
+        // this minimum.
+        var min_width = gobject.ext.Value.newFrom(@as(c_int, 320));
+        defer min_width.unset();
+        gobject.Object.setProperty(
+            split_tree.as(gobject.Object),
+            "width-request",
+            &min_width,
+        );
+
         // Create the panel but keep it hidden until toggled. GtkPaned hides
         // the handle when the end child is invisible, so a hidden panel
         // looks exactly like the stock layout.
