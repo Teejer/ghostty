@@ -821,8 +821,9 @@ pub const AiPanel = extern struct {
         buttons.append(deny.as(gtk.Widget));
         outer.append(buttons.as(gtk.Widget));
 
-        priv.transcript.addChildAtAnchor(outer.as(gtk.Widget), anchor);
-        self.trackBar(outer.as(gtk.Widget), label);
+        const sw = Self.wrapPill(outer.as(gtk.Widget));
+        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
+        self.trackBar(sw.as(gtk.Widget), label);
 
         priv.exec_id = a.dupe(u8, id) catch return;
         priv.exec_cmd = a.dupe(u8, cmd) catch return;
@@ -1432,26 +1433,22 @@ pub const AiPanel = extern struct {
         ) catch null;
     }
 
-    /// TextView allocates children their NATURAL width, and a
-    /// wrapping label's natural width is the whole text on one line,
-    /// which is why pills ran off the panel edge. max-width-chars
-    /// caps the natural width (width-request only floors it), so
-    /// labels are capped by proportion: chars * target / full-width.
-    fn pinLabelWidth(lbl: *gtk.Label, target: c_int) void {
-        lbl.setMaxWidthChars(-1);
-        var min: c_int = 0;
-        var nat: c_int = 0;
-        lbl.as(gtk.Widget).measure(.horizontal, -1, &min, &nat, null, null);
-        if (nat <= target or nat <= 0) return;
-        const text = std.mem.span(lbl.getText());
-        const chars = std.unicode.utf8CountCodepoints(text) catch text.len;
-        if (chars == 0) return;
-        const want: i64 = target;
-        const nchars: i64 = @intCast(chars);
-        const full: i64 = nat;
-        var cap: c_int = @intCast(@divFloor(want * nchars, full));
-        if (cap < 1) cap = 1;
-        lbl.setMaxWidthChars(cap);
+    /// TextView allocates children their natural width, and a GTK4
+    /// wrapping label's natural width is the whole text on one line —
+    /// no property shrinks it (max-width-chars only applies to
+    /// ellipsizing labels). So each pill is wrapped in a Scrolled-
+    /// Window with both scrollbars never: scrolled windows are
+    /// scrollable and report a small natural width themselves, which
+    /// makes width-request the exact allocation TextView gives them.
+    /// propagate-natural-height keeps the full wrapped height, so the
+    /// scrollbars could never have anything to scroll.
+    fn wrapPill(child: *gtk.Widget) *gtk.ScrolledWindow {
+        const sw: *gtk.ScrolledWindow = .new();
+        sw.setPolicy(.never, .never);
+        sw.setPropagateNaturalHeight(1);
+        sw.as(gtk.Widget).setCanTarget(0);
+        sw.setChild(child);
+        return sw;
     }
 
     fn pinWidgetWidth(w: *gtk.Widget, target: c_int) void {
@@ -1472,7 +1469,10 @@ pub const AiPanel = extern struct {
         if (wpx <= 60 or wpx == priv.bar_w) return;
         priv.bar_w = wpx;
         for (priv.bars.items) |bar| {
-            if (bar.l1) |lbl| Self.pinLabelWidth(lbl, wpx - 14);
+            if (bar.l1) |lbl| Self.pinWidgetWidth(
+                lbl.as(gtk.Widget),
+                wpx - 14,
+            );
             Self.pinWidgetWidth(bar.w, wpx - 14);
         }
     }
@@ -1486,7 +1486,10 @@ pub const AiPanel = extern struct {
         priv.last_char = 'x';
         const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
         if (wpx > 60) {
-            if (label) |lbl| Self.pinLabelWidth(lbl, wpx - 14);
+            if (label) |lbl| Self.pinWidgetWidth(
+                lbl.as(gtk.Widget),
+                wpx - 14,
+            );
             Self.pinWidgetWidth(w, wpx - 14);
         }
     }
@@ -1522,8 +1525,9 @@ pub const AiPanel = extern struct {
             row.append(lbl.as(gtk.Widget));
         }
 
-        priv.transcript.addChildAtAnchor(row.as(gtk.Widget), anchor);
-        self.trackBar(row.as(gtk.Widget), label);
+        const sw = Self.wrapPill(row.as(gtk.Widget));
+        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
+        self.trackBar(sw.as(gtk.Widget), label);
     }
 
     /// Anchor a fresh rounded pill for the turn's answer text.
@@ -1540,8 +1544,9 @@ pub const AiPanel = extern struct {
         label.setWrap(1);
         label.setSelectable(1);
         label.as(gtk.Widget).addCssClass("ai-turn");
-        priv.transcript.addChildAtAnchor(label.as(gtk.Widget), anchor);
-        self.trackBar(label.as(gtk.Widget), label);
+        const sw = Self.wrapPill(label.as(gtk.Widget));
+        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
+        self.trackBar(sw.as(gtk.Widget), label);
         priv.ai_label = label;
     }
 
@@ -1561,10 +1566,6 @@ pub const AiPanel = extern struct {
         if (priv.ai_stream) |old| a.free(old);
         priv.ai_stream = next;
         label.setText(next.ptr);
-        // The cap was computed for the shorter text; re-cap so the
-        // growing pill keeps its natural width inside the view.
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx > 60) Self.pinLabelWidth(label, wpx - 14);
         // Child widgets do not trigger the buffer's insert-scroll,
         // so keep the view pinned while the pill grows.
         self.scrollSoon();
@@ -1643,8 +1644,9 @@ pub const AiPanel = extern struct {
         bar.setWrap(1);
         bar.setSelectable(1);
         bar.as(gtk.Widget).addCssClass(css_class);
-        priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
-        self.trackBar(bar.as(gtk.Widget), bar);
+        const sw = Self.wrapPill(bar.as(gtk.Widget));
+        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
+        self.trackBar(sw.as(gtk.Widget), bar);
     }
 
     /// A standalone amber exec-status line.
