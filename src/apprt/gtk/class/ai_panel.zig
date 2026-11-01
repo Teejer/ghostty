@@ -93,6 +93,12 @@ pub const AiPanel = extern struct {
         /// button is a child anchor inside the TextView; the body text
         /// spans the two marks and is hidden via the shared invisible
         /// tag when collapsed.
+        /// A pinned-width child widget in the transcript (pill).
+        const Bar = struct {
+            w: *gtk.Widget,
+            l1: ?*gtk.Label = null,
+        };
+
         const ThinkingBlock = struct {
             button: *gtk.Button,
             start: *gtk.TextMark,
@@ -151,8 +157,13 @@ pub const AiPanel = extern struct {
         /// Child-label bars (message pills, exec pills). Their pinned
         /// width comes from the view width at creation time; the list
         /// lets resizes re-pin them (see syncBarWidths).
-        bars: std.ArrayList(*gtk.Widget) = .empty,
+        bars: std.ArrayList(Bar) = .empty,
         bar_w: c_int = 0,
+
+        /// Last character appended to the buffer (0 = empty, 'x' =
+        /// a child widget followed). Guards block-leading newlines so
+        /// content never stacks blank lines.
+        last_char: u8 = 0,
         open_think: ?usize = null,
 
         /// AI-proposed command awaiting this tab's decision (Run/Deny
@@ -231,6 +242,7 @@ pub const AiPanel = extern struct {
     fn append(self: *Self, text: []const u8, tag: ?*gtk.TextTag) void {
         const priv = self.private();
         const buffer = priv.transcript.getBuffer();
+        if (text.len > 0) priv.last_char = text[text.len - 1];
 
         const z = glib.ext.dupeZ(u8, text);
         defer glib.free(z.ptr);
@@ -648,6 +660,7 @@ pub const AiPanel = extern struct {
         const priv = self.private();
         const buffer = priv.transcript.getBuffer();
 
+        self.nl();
         var iter: gtk.TextIter = undefined;
         buffer.getEndIter(&iter);
         const anchor = buffer.createChildAnchor(&iter);
@@ -664,6 +677,7 @@ pub const AiPanel = extern struct {
             .{},
         );
         priv.transcript.addChildAtAnchor(button.as(gtk.Widget), anchor);
+        priv.last_char = '\n';
 
         self.append("\n", null);
 
@@ -763,10 +777,10 @@ pub const AiPanel = extern struct {
         self.clearExecProposal();
 
         const buffer = priv.transcript.getBuffer();
+        self.nl();
         var iter: gtk.TextIter = undefined;
         buffer.getEndIter(&iter);
         const anchor = buffer.createChildAnchor(&iter);
-        self.append("\n", null);
 
         const outer = gtk.Box.new(.vertical, 4);
         outer.as(gtk.Widget).addCssClass("ai-exec");
@@ -807,18 +821,8 @@ pub const AiPanel = extern struct {
         buttons.append(deny.as(gtk.Widget));
         outer.append(buttons.as(gtk.Widget));
 
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx > 60) {
-            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-            defer wr_value.unset();
-            gobject.Object.setProperty(
-                outer.as(gobject.Object),
-                "width-request",
-                &wr_value,
-            );
-        }
         priv.transcript.addChildAtAnchor(outer.as(gtk.Widget), anchor);
-        self.trackBar(outer.as(gtk.Widget));
+        self.trackBar(outer.as(gtk.Widget), label);
 
         priv.exec_id = a.dupe(u8, id) catch return;
         priv.exec_cmd = a.dupe(u8, cmd) catch return;
@@ -1428,30 +1432,69 @@ pub const AiPanel = extern struct {
         ) catch null;
     }
 
-    /// TextView allocates children their own requested width, so a
-    /// bar pinned at creation time hangs off the edge once the panel
-    /// gets narrower. Re-pin every bar when the view width changes;
-    /// called from the 300ms daemon poll.
+    /// TextView allocates children their NATURAL width, and a
+    /// wrapping label's natural width is the whole text on one line,
+    /// which is why pills ran off the panel edge. max-width-chars
+    /// caps the natural width (width-request only floors it), so
+    /// labels are capped by proportion: chars * target / full-width.
+    fn pinLabelWidth(lbl: *gtk.Label, target: c_int) void {
+        lbl.setMaxWidthChars(-1);
+        var min: c_int = 0;
+        var nat: c_int = 0;
+        lbl.as(gtk.Widget).measure(.horizontal, -1, &min, &nat, null, null);
+        if (nat <= target or nat <= 0) return;
+        const text = std.mem.span(lbl.getText());
+        const chars = std.unicode.utf8CountCodepoints(text) catch text.len;
+        if (chars == 0) return;
+        const want: i64 = target;
+        const nchars: i64 = @intCast(chars);
+        const full: i64 = nat;
+        var cap: c_int = @intCast(@divFloor(want * nchars, full));
+        if (cap < 1) cap = 1;
+        lbl.setMaxWidthChars(cap);
+    }
+
+    fn pinWidgetWidth(w: *gtk.Widget, target: c_int) void {
+        var value = gobject.ext.Value.newFrom(target);
+        defer value.unset();
+        gobject.Object.setProperty(
+            w.as(gobject.Object),
+            "width-request",
+            &value,
+        );
+    }
+
+    /// Re-cap every bar when the view width changed; called from the
+    /// 300ms daemon poll.
     fn syncBarWidths(self: *Self) void {
         const priv = self.private();
         const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
         if (wpx <= 60 or wpx == priv.bar_w) return;
         priv.bar_w = wpx;
-        var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-        defer wr_value.unset();
         for (priv.bars.items) |bar| {
-            gobject.Object.setProperty(
-                bar.as(gobject.Object),
-                "width-request",
-                &wr_value,
-            );
+            if (bar.l1) |lbl| Self.pinLabelWidth(lbl, wpx - 14);
+            Self.pinWidgetWidth(bar.w, wpx - 14);
         }
     }
 
-    /// Register a bar so its width tracks the panel.
-    fn trackBar(self: *Self, widget: *gtk.Widget) void {
+    /// Register a bar, pin it to the current view width, and mark the
+    /// buffer position as "widget line" so the next block still gets
+    /// its own newline.
+    fn trackBar(self: *Self, w: *gtk.Widget, label: ?*gtk.Label) void {
         const priv = self.private();
-        priv.bars.append(alloc(), widget) catch {};
+        priv.bars.append(alloc(), .{ .w = w, .l1 = label }) catch {};
+        priv.last_char = 'x';
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) {
+            if (label) |lbl| Self.pinLabelWidth(lbl, wpx - 14);
+            Self.pinWidgetWidth(w, wpx - 14);
+        }
+    }
+
+    /// Newline before a block, unless the buffer already ends on one.
+    fn nl(self: *Self) void {
+        const priv = self.private();
+        if (priv.last_char != '\n') self.append("\n", null);
     }
 
     /// User message bar: the blue pill, with the arrival time as a
@@ -1479,32 +1522,15 @@ pub const AiPanel = extern struct {
             row.append(lbl.as(gtk.Widget));
         }
 
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx > 60) {
-            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-            defer wr_value.unset();
-            gobject.Object.setProperty(
-                row.as(gobject.Object),
-                "width-request",
-                &wr_value,
-            );
-            var lw_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-            defer lw_value.unset();
-            gobject.Object.setProperty(
-                label.as(gobject.Object),
-                "width-request",
-                &lw_value,
-            );
-        }
         priv.transcript.addChildAtAnchor(row.as(gtk.Widget), anchor);
-        self.trackBar(row.as(gtk.Widget));
+        self.trackBar(row.as(gtk.Widget), label);
     }
 
     /// Anchor a fresh rounded pill for the turn's answer text.
     fn beginAiTurnLabel(self: *Self) void {
         const priv = self.private();
         const tbuf = priv.transcript.getBuffer();
-        self.append("\n", null);
+        self.nl();
         var it: gtk.TextIter = undefined;
         tbuf.getEndIter(&it);
         const anchor = tbuf.createChildAnchor(&it);
@@ -1514,18 +1540,8 @@ pub const AiPanel = extern struct {
         label.setWrap(1);
         label.setSelectable(1);
         label.as(gtk.Widget).addCssClass("ai-turn");
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx > 60) {
-            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-            defer wr_value.unset();
-            gobject.Object.setProperty(
-                label.as(gobject.Object),
-                "width-request",
-                &wr_value,
-            );
-        }
         priv.transcript.addChildAtAnchor(label.as(gtk.Widget), anchor);
-        self.trackBar(label.as(gtk.Widget));
+        self.trackBar(label.as(gtk.Widget), label);
         priv.ai_label = label;
     }
 
@@ -1545,6 +1561,10 @@ pub const AiPanel = extern struct {
         if (priv.ai_stream) |old| a.free(old);
         priv.ai_stream = next;
         label.setText(next.ptr);
+        // The cap was computed for the shorter text; re-cap so the
+        // growing pill keeps its natural width inside the view.
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) Self.pinLabelWidth(label, wpx - 14);
         // Child widgets do not trigger the buffer's insert-scroll,
         // so keep the view pinned while the pill grows.
         self.scrollSoon();
@@ -1580,12 +1600,13 @@ pub const AiPanel = extern struct {
         const priv = self.private();
         const a = alloc();
         const tbuf = priv.transcript.getBuffer();
-        self.append("\n", null);
+        self.nl();
         var it: gtk.TextIter = undefined;
         tbuf.getEndIter(&it);
         const anchor = tbuf.createChildAnchor(&it);
 
         const label = gtk.Label.new(hm);
+        label.as(gtk.Widget).addCssClass("ai-cap");
         label.setXalign(0);
         label.as(gtk.Widget).addCssClass("caption");
         label.as(gtk.Widget).addCssClass("dim-label");
@@ -1622,25 +1643,13 @@ pub const AiPanel = extern struct {
         bar.setWrap(1);
         bar.setSelectable(1);
         bar.as(gtk.Widget).addCssClass(css_class);
-        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
-        if (wpx > 60) {
-            // GTK4 has no width-request setter function; set the
-            // property (same dance as the panel's own width-request).
-            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
-            defer wr_value.unset();
-            gobject.Object.setProperty(
-                bar.as(gobject.Object),
-                "width-request",
-                &wr_value,
-            );
-        }
         priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
-        self.trackBar(bar.as(gtk.Widget));
+        self.trackBar(bar.as(gtk.Widget), bar);
     }
 
     /// A standalone amber exec-status line.
     fn appendExecBar(self: *Self, text: [:0]const u8) void {
-        self.append("\n", null);
+        self.nl();
         self.appendBar(text, "ai-exec");
         self.append("\n", null);
         self.scrollSoon();
@@ -1671,7 +1680,7 @@ pub const AiPanel = extern struct {
         const hm = stamp();
         defer if (hm) |v| alloc().free(v);
 
-        self.append("\n", null);
+        self.nl();
         self.appendMsgBar(owned, hm);
         self.append("\n", null);
         self.scrollSoon();
