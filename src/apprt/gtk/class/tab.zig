@@ -423,6 +423,62 @@ pub const Tab = extern struct {
             .dumpStringAlloc(alloc, .{ .active = .{} });
     }
 
+    /// The active surface's working directory as tracked by shell
+    /// integration (OSC 7), if known. Sent with each chat message so
+    /// the daemon can find per-project instruction files.
+    pub fn activeSurfacePwd(
+        self: *Self,
+        alloc: Allocator,
+    ) !?[]const u8 {
+        const gtk_surface = (self.getActiveSurface()) orelse
+            return null;
+        const core = gtk_surface.core() orelse return null;
+        return core.pwd(alloc) catch null;
+    }
+
+    /// Scrollback text of the active surface: the `.screen` dump
+    /// includes the page history, unlike the `.active` dump. Tail-
+    /// limited to max_lines lines and 64 KiB so a huge buffer cannot
+    /// flood the daemon socket.
+    pub fn dumpActiveSurfaceScrollback(
+        self: *Self,
+        alloc: Allocator,
+        max_lines: usize,
+    ) ![]const u8 {
+        const gtk_surface = (self.getActiveSurface()) orelse
+            return error.NoActiveSurface;
+        const core = gtk_surface.core() orelse
+            return error.NoActiveSurface;
+
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+
+        const all = try core.renderer_state.terminal.screens.active
+            .dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(all);
+
+        // Walk back to the start of the newest max_lines lines.
+        var lines: usize = 0;
+        var start: usize = 0;
+        var i: usize = all.len;
+        while (i > 0) {
+            i -= 1;
+            if (all[i] == '\n') {
+                if (lines == max_lines) {
+                    start = i + 1;
+                    break;
+                }
+                lines += 1;
+            }
+        }
+        const tail = all[start..];
+        const from = if (tail.len > 64 * 1024)
+            tail.len - 64 * 1024
+        else
+            0;
+        return try alloc.dupe(u8, tail[from..]);
+    }
+
     /// Inject raw text into the active surface's pty, exactly what the
     /// "write" keybinding action does (no bracketed paste). The AI
     /// panel may only call this after the user approved the command;

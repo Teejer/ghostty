@@ -87,6 +87,7 @@ pub const AiPanel = extern struct {
         auto: ?bool = null,
         dangerous: ?bool = null,
         ok: ?bool = null,
+        lines: ?i64 = null,
     };
 
     const Private = struct {
@@ -131,6 +132,7 @@ pub const AiPanel = extern struct {
 
         /// True while we are mid-way writing an assistant turn so we
         /// only prefix the "ai: " label once per turn.
+        stop_btn: ?*gtk.Button = null,
         ai_turn_open: bool = false,
 
         /// Stats for the in-flight AI turn, shown as an estimated
@@ -491,6 +493,7 @@ pub const AiPanel = extern struct {
         } else if (std.mem.eql(u8, msg.type, "done")) {
             self.closeThinkingBlock();
             const priv = self.private();
+            if (priv.stop_btn) |b| b.as(gtk.Widget).setVisible(0);
             if (priv.ai_turn_open) {
                 priv.ai_turn_open = false;
                 self.endAiTurn();
@@ -535,8 +538,29 @@ pub const AiPanel = extern struct {
             const cur = self.private().cur_provider orelse "";
             if (std.mem.eql(u8, msg.provider orelse "", cur))
                 self.setProviderDot(msg.ok orelse false);
+        } else if (std.mem.eql(u8, msg.type, "scrollback")) {
+            const id = msg.id orelse "";
+            const want: usize = @intCast(@max(1, @min(
+                @as(i64, 2000),
+                msg.lines orelse 200,
+            )));
+            const dump: []const u8 = if (self.private().tab) |tab|
+                tab.dumpActiveSurfaceScrollback(alloc(), want) catch ""
+            else
+                "";
+            defer if (dump.len > 0) alloc().free(dump);
+            log.debug("scrollback served id={s} bytes={d}", .{ id, dump.len });
+            self.sendJson(struct {
+                type: []const u8 = "scrollback_reply",
+                id: []const u8,
+                output: []const u8,
+            }{ .id = id, .output = dump });
         } else if (std.mem.eql(u8, msg.type, "status")) {
-            // No UI for turn states yet.
+            // The stop button mirrors the daemon's turn state.
+            const active = std.mem.eql(u8, msg.state orelse "", "thinking") or
+                std.mem.eql(u8, msg.state orelse "", "generating");
+            if (self.private().stop_btn) |b|
+                b.as(gtk.Widget).setVisible(@intFromBool(active));
         }
     }
 
@@ -860,6 +884,16 @@ pub const AiPanel = extern struct {
                 return 0;
             }
         }.call, self);
+    }
+
+    fn onStopClicked(
+        _: *gtk.Button,
+        self: *Self,
+    ) callconv(.c) void {
+        if (self.private().stop_btn) |b| b.as(gtk.Widget).setVisible(0);
+        self.sendJson(struct {
+            type: []const u8 = "stop",
+        }{});
     }
 
     fn onExecRunClicked(
@@ -1303,6 +1337,23 @@ pub const AiPanel = extern struct {
         priv.dot = dot;
         header_row.append(header.as(gtk.Widget));
         header_row.append(dot.as(gtk.Widget));
+
+        // Stop button: visible only while the daemon is thinking or
+        // generating; cancels the turn without starting a new one.
+        const stop_btn = gtk.Button.newWithLabel("\u{25a0}");
+        stop_btn.as(gtk.Widget).addCssClass("flat");
+        stop_btn.as(gtk.Widget).addCssClass("ai-thinking");
+        stop_btn.as(gtk.Widget).setTooltipText("Stop this response");
+        stop_btn.as(gtk.Widget).setVisible(0);
+        _ = gtk.Button.signals.clicked.connect(
+            stop_btn,
+            *Self,
+            onStopClicked,
+            self,
+            .{},
+        );
+        header_row.append(stop_btn.as(gtk.Widget));
+        self.private().stop_btn = stop_btn;
         box.append(header_row.as(gtk.Widget));
 
         // Model picker row: shown once the daemon tells us which
@@ -1570,7 +1621,10 @@ pub const AiPanel = extern struct {
         ) catch return;
         if (priv.ai_stream) |old| a.free(old);
         priv.ai_stream = next;
-        label.setText(next.ptr);
+        if (aiPango(a, next)) |markup| {
+            defer a.free(markup);
+            label.setMarkup(markup.ptr);
+        } else |_| label.setText(next.ptr);
         // Child widgets do not trigger the buffer's insert-scroll,
         // so keep the view pinned while the pill grows.
         self.scrollSoon();
@@ -1775,11 +1829,18 @@ pub const AiPanel = extern struct {
             } else |_| {}
         }
 
+        const cwd: []const u8 = if (priv.tab) |tab|
+            (tab.activeSurfacePwd(alloc()) catch null) orelse ""
+        else
+            "";
+        defer if (cwd.len > 0) alloc().free(cwd);
+
         self.sendJson(struct {
             type: []const u8 = "chat",
             text: []const u8,
             screen: []const u8,
-        }{ .text = text, .screen = screen });
+            cwd: []const u8,
+        }{ .text = text, .screen = screen, .cwd = cwd });
     }
 
     fn finalize(self: *Self) callconv(.c) void {
@@ -1827,3 +1888,95 @@ pub const AiPanel = extern struct {
         pub const as = C.Class.as;
     };
 };
+
+/// Very small markdown subset for the answer pill: escapes XML, then
+/// converts **bold**, `code`, leading # headers, and fenced code
+/// blocks (rendered monospace, fence lines dropped) into pango
+/// markup. Deliberately conservative so half-streamed markdown stays
+/// literal: a marker only converts when its pair is already present.
+fn appendMdEscaped(
+    a: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    text: []const u8,
+) !void {
+    for (text) |ch| switch (ch) {
+        '&' => try a.appendSlice(alloc, "&amp;"),
+        '<' => try a.appendSlice(alloc, "&lt;"),
+        '>' => try a.appendSlice(alloc, "&gt;"),
+        else => try a.append(alloc, ch),
+    };
+}
+
+fn appendMdInline(
+    a: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    line: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const rest = line[i..];
+        if (std.mem.startsWith(u8, rest, "**")) {
+            if (std.mem.indexOf(u8, rest[2..], "**")) |off| {
+                try a.appendSlice(alloc, "<b>");
+                try appendMdEscaped(a, alloc, rest[2 .. 2 + off]);
+                try a.appendSlice(alloc, "</b>");
+                i += off + 4;
+                continue;
+            }
+        }
+        if (rest[0] == '`') {
+            if (std.mem.indexOfScalar(u8, rest[1..], '`')) |off| {
+                try a.appendSlice(
+                    alloc,
+                    "<span font_family=\"monospace\">",
+                );
+                try appendMdEscaped(a, alloc, rest[1 .. 1 + off]);
+                try a.appendSlice(alloc, "</span>");
+                i += off + 2;
+                continue;
+            }
+        }
+        switch (rest[0]) {
+            '&' => try a.appendSlice(alloc, "&amp;"),
+            '<' => try a.appendSlice(alloc, "&lt;"),
+            '>' => try a.appendSlice(alloc, "&gt;"),
+            else => try a.append(alloc, rest[0]),
+        }
+        i += 1;
+    }
+}
+
+fn aiPango(alloc: std.mem.Allocator, text: []const u8) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "<span>");
+    var in_code = false;
+    var first_out = true;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (std.mem.startsWith(u8, std.mem.trim(u8, line, " "), "```")) {
+            in_code = !in_code;
+            continue; // fence lines vanish; content is monospace
+        }
+        if (!first_out) try out.append(alloc, '\n');
+        first_out = false;
+        if (in_code) {
+            try out.appendSlice(alloc,
+                "<span font_family=\"monospace\" background=\"rgba(0,0,0,0.25)\">");
+            try appendMdEscaped(&out, alloc, line);
+            try out.appendSlice(alloc, "</span>");
+            continue;
+        }
+        if (line.len > 0 and line[0] == '#') {
+            const body = std.mem.trim(u8, line[1..], "# ");
+            try out.appendSlice(alloc, "<b>");
+            try appendMdInline(&out, alloc, body);
+            try out.appendSlice(alloc, "</b>");
+            continue;
+        }
+        try appendMdInline(&out, alloc, line);
+    }
+    try out.appendSlice(alloc, "</span>");
+    return try out.toOwnedSliceSentinel(alloc, 0);
+}
