@@ -147,6 +147,12 @@ pub const AiPanel = extern struct {
         /// Collapsible thinking blocks; open_think indexes the block
         /// currently receiving reasoning deltas, if any.
         thinking_blocks: std.ArrayList(ThinkingBlock) = .empty,
+
+        /// Child-label bars (message pills, exec pills). Their pinned
+        /// width comes from the view width at creation time; the list
+        /// lets resizes re-pin them (see syncBarWidths).
+        bars: std.ArrayList(*gtk.Widget) = .empty,
+        bar_w: c_int = 0,
         open_think: ?usize = null,
 
         /// AI-proposed command awaiting this tab's decision (Run/Deny
@@ -410,6 +416,7 @@ pub const AiPanel = extern struct {
                 return 0;
             }
         }
+        self.syncBarWidths();
         if (priv.exec_active or priv.follow_active) self.execPollTick();
         return 1;
     }
@@ -810,6 +817,7 @@ pub const AiPanel = extern struct {
             );
         }
         priv.transcript.addChildAtAnchor(outer.as(gtk.Widget), anchor);
+        self.trackBar(outer.as(gtk.Widget));
 
         priv.exec_id = a.dupe(u8, id) catch return;
         priv.exec_cmd = a.dupe(u8, cmd) catch return;
@@ -1415,6 +1423,32 @@ pub const AiPanel = extern struct {
         ) catch null;
     }
 
+    /// TextView allocates children their own requested width, so a
+    /// bar pinned at creation time hangs off the edge once the panel
+    /// gets narrower. Re-pin every bar when the view width changes;
+    /// called from the 300ms daemon poll.
+    fn syncBarWidths(self: *Self) void {
+        const priv = self.private();
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx <= 60 or wpx == priv.bar_w) return;
+        priv.bar_w = wpx;
+        var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+        defer wr_value.unset();
+        for (priv.bars.items) |bar| {
+            gobject.Object.setProperty(
+                bar.as(gobject.Object),
+                "width-request",
+                &wr_value,
+            );
+        }
+    }
+
+    /// Register a bar so its width tracks the panel.
+    fn trackBar(self: *Self, widget: *gtk.Widget) void {
+        const priv = self.private();
+        priv.bars.append(alloc(), widget) catch {};
+    }
+
     /// User message bar: the blue pill, with the arrival time as a
     /// small dim caption on the line below it.
     fn appendMsgBar(self: *Self, text: [:0]const u8, hm: ?[:0]const u8) void {
@@ -1458,6 +1492,7 @@ pub const AiPanel = extern struct {
             );
         }
         priv.transcript.addChildAtAnchor(row.as(gtk.Widget), anchor);
+        self.trackBar(row.as(gtk.Widget));
     }
 
     /// Anchor a fresh rounded pill for the turn's answer text.
@@ -1485,6 +1520,7 @@ pub const AiPanel = extern struct {
             );
         }
         priv.transcript.addChildAtAnchor(label.as(gtk.Widget), anchor);
+        self.trackBar(label.as(gtk.Widget));
         priv.ai_label = label;
     }
 
@@ -1513,7 +1549,24 @@ pub const AiPanel = extern struct {
     /// it short); drop the streaming references, keep the label.
     fn endAiTurn(self: *Self) void {
         const priv = self.private();
-        if (priv.ai_stream) |st| alloc().free(st);
+        const a = alloc();
+        if (priv.ai_stream) |st| {
+            // Models routinely end answers with blank lines; inside a
+            // pill that reads as a layout bug, so trim the tail.
+            var end_i: usize = st.len;
+            while (end_i > 0 and std.ascii.isWhitespace(st[end_i - 1]))
+                end_i -= 1;
+            const trimmed = st[0..end_i];
+            if (trimmed.len != st.len) {
+                if (priv.ai_label) |lbl| {
+                    if (std.fmt.allocPrintSentinel(a, "{s}", .{trimmed}, 0)) |z| {
+                        lbl.setText(z.ptr);
+                        a.free(z);
+                    } else |_| {}
+                }
+            }
+            a.free(st);
+        }
         priv.ai_stream = null;
         priv.ai_label = null;
     }
@@ -1577,6 +1630,7 @@ pub const AiPanel = extern struct {
             );
         }
         priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
+        self.trackBar(bar.as(gtk.Widget));
     }
 
     /// A standalone amber exec-status line.
