@@ -85,6 +85,7 @@ pub const AiPanel = extern struct {
         id: ?[]const u8 = null,
         command: ?[]const u8 = null,
         auto: ?bool = null,
+        dangerous: ?bool = null,
         ok: ?bool = null,
     };
 
@@ -526,7 +527,7 @@ pub const AiPanel = extern struct {
                     self.private().ai_turn_open = false;
                     self.endAiTurn();
                 }
-                self.appendExecProposal(id, cmd);
+                self.appendExecProposal(id, cmd, msg.dangerous orelse false);
             }
         } else if (std.mem.eql(u8, msg.type, "exec_cancel")) {
             self.clearExecProposal();
@@ -771,7 +772,12 @@ pub const AiPanel = extern struct {
     /// One amber pill: the proposed command and its Approve/Deny
     /// buttons share a single rounded background (separate bars for
     /// text and buttons read as two misaligned boxes).
-    fn appendExecProposal(self: *Self, id: []const u8, cmd: []const u8) void {
+    fn appendExecProposal(
+        self: *Self,
+        id: []const u8,
+        cmd: []const u8,
+        dangerous: bool,
+    ) void {
         const priv = self.private();
         const a = alloc();
         self.clearExecProposal();
@@ -784,15 +790,20 @@ pub const AiPanel = extern struct {
 
         const outer = gtk.Box.new(.vertical, 4);
         outer.as(gtk.Widget).addCssClass("ai-exec");
+        if (dangerous) outer.as(gtk.Widget).addCssClass("ai-exec-warn");
 
-        const text = std.fmt.allocPrintSentinel(
-            a,
-            "Run: {s}",
-            .{cmd},
-            0,
-        ) catch return;
-        defer a.free(text);
-        const label = gtk.Label.new(text);
+        const text = if (dangerous)
+            std.fmt.allocPrintSentinel(
+                a,
+                "\u{26a0} dangerous \u{2014} run: {s}",
+                .{cmd},
+                0,
+            )
+        else
+            std.fmt.allocPrintSentinel(a, "Run: {s}", .{cmd}, 0);
+        const textz = text catch return;
+        defer a.free(textz);
+        const label = gtk.Label.new(textz);
         label.setXalign(0);
         label.setWrap(1);
         label.setSelectable(1);
@@ -800,7 +811,10 @@ pub const AiPanel = extern struct {
 
         const buttons = gtk.Box.new(.horizontal, 6);
         const run = gtk.Button.newWithLabel("Approve");
-        run.as(gtk.Widget).addCssClass("suggested-action");
+        run.as(gtk.Widget).addCssClass(if (dangerous)
+            "destructive-action"
+        else
+            "suggested-action");
         const deny = gtk.Button.newWithLabel("Deny");
         deny.as(gtk.Widget).addCssClass("flat");
         _ = gtk.Button.signals.clicked.connect(
@@ -1240,6 +1254,9 @@ pub const AiPanel = extern struct {
             \\.ai-exec button,
             \\button.ai-thinking {
             \\    cursor: pointer;
+            \\}
+            \\.ai-exec-warn {
+            \\    background: rgba(213,80,80,0.30);
             \\}
             \\.ai-time {
             \\    font-size: 0.75em;
