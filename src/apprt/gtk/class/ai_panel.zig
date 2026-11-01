@@ -159,6 +159,8 @@ pub const AiPanel = extern struct {
         /// lets resizes re-pin them (see syncBarWidths).
         bars: std.ArrayList(Bar) = .empty,
         bar_w: c_int = 0,
+        probe_bar: ?Bar = null,
+        probe_src: ?c_uint = null,
 
         /// Last character appended to the buffer (0 = empty, 'x' =
         /// a child widget followed). Guards block-leading newlines so
@@ -821,9 +823,8 @@ pub const AiPanel = extern struct {
         buttons.append(deny.as(gtk.Widget));
         outer.append(buttons.as(gtk.Widget));
 
-        const sw = Self.wrapPill(outer.as(gtk.Widget));
-        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
-        self.trackBar(sw.as(gtk.Widget), label);
+        priv.transcript.addChildAtAnchor(outer.as(gtk.Widget), anchor);
+        self.trackBar(outer.as(gtk.Widget), label);
 
         priv.exec_id = a.dupe(u8, id) catch return;
         priv.exec_cmd = a.dupe(u8, cmd) catch return;
@@ -1256,14 +1257,13 @@ pub const AiPanel = extern struct {
         w.setMarginBottom(6);
         w.setMarginStart(6);
         w.setMarginEnd(6);
-        // GTK4 has no width-request setter function; set the property.
-        var width_value = gobject.ext.Value.newFrom(@as(c_int, 320));
-        defer width_value.unset();
-        gobject.Object.setProperty(
-            w.as(gobject.Object),
-            "width-request",
-            &width_value,
-        );
+        // No width-request here on purpose: a minimum on the panel
+        // root is a trap. GtkPaned cannot shrink the end child below
+        // its minimum, so once the window is narrower than
+        // terminal_min + minimum the panel spills off the window's
+        // right edge and the overflow silently eats the right side
+        // of every pill and caption. The initial width comes from
+        // the paned position timer in tab.zig instead.
 
         // Header: title plus a connection light. Green = session
         // ready, amber = socket open but no hello reply yet, dim =
@@ -1433,24 +1433,6 @@ pub const AiPanel = extern struct {
         ) catch null;
     }
 
-    /// TextView allocates children their natural width, and a GTK4
-    /// wrapping label's natural width is the whole text on one line —
-    /// no property shrinks it (max-width-chars only applies to
-    /// ellipsizing labels). So each pill is wrapped in a Scrolled-
-    /// Window with both scrollbars never: scrolled windows are
-    /// scrollable and report a small natural width themselves, which
-    /// makes width-request the exact allocation TextView gives them.
-    /// propagate-natural-height keeps the full wrapped height, so the
-    /// scrollbars could never have anything to scroll.
-    fn wrapPill(child: *gtk.Widget) *gtk.ScrolledWindow {
-        const sw: *gtk.ScrolledWindow = .new();
-        sw.setPolicy(.never, .never);
-        sw.setPropagateNaturalHeight(1);
-        sw.as(gtk.Widget).setCanTarget(0);
-        sw.setChild(child);
-        return sw;
-    }
-
     fn pinWidgetWidth(w: *gtk.Widget, target: c_int) void {
         var value = gobject.ext.Value.newFrom(target);
         defer value.unset();
@@ -1468,6 +1450,9 @@ pub const AiPanel = extern struct {
         const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
         if (wpx <= 60 or wpx == priv.bar_w) return;
         priv.bar_w = wpx;
+        log.debug("bar-sync re-pin view={d} bars={d}", .{
+            wpx, priv.bars.items.len,
+        });
         for (priv.bars.items) |bar| {
             if (bar.l1) |lbl| Self.pinWidgetWidth(
                 lbl.as(gtk.Widget),
@@ -1475,6 +1460,53 @@ pub const AiPanel = extern struct {
             );
             Self.pinWidgetWidth(bar.w, wpx - 14);
         }
+    }
+
+    /// TEMP DEBUG: dump real size data once layout has settled.
+    fn logBarGeometry(self: *Self, bar: Private.Bar) void {
+        const priv = self.private();
+        const view = priv.transcript.as(gtk.Widget);
+        var bmin: c_int = 0;
+        var bnat: c_int = 0;
+        bar.w.measure(.horizontal, -1, &bmin, &bnat, null, null);
+        var amin: c_int = 0;
+        var anat: c_int = 0;
+        if (bar.l1) |lbl| lbl.as(gtk.Widget).measure(
+            .horizontal,
+            -1,
+            &amin,
+            &anat,
+            null,
+            null,
+        );
+        log.debug(
+            "bar-geo view_alloc={d} view_lmargin={d} bar_alloc={d} " ++
+                "bar_min={d} bar_nat={d} lbl_min={d} lbl_nat={d}",
+            .{
+                view.getAllocatedWidth(),
+                priv.transcript.getLeftMargin(),
+                bar.w.getAllocatedWidth(),
+                bmin,
+                bnat,
+                amin,
+                anat,
+            },
+        );
+    }
+
+    fn logBarGeometrySoon(self: *Self, bar: Private.Bar) void {
+        const priv = self.private();
+        priv.probe_bar = bar;
+        if (priv.probe_src) |id| _ = glib.Source.remove(id);
+        priv.probe_src = glib.timeoutAdd(400, struct {
+            fn call(ud: ?*anyopaque) callconv(.c) c_int {
+                const self_: *Self = @ptrCast(@alignCast(ud));
+                const p = self_.private();
+                p.probe_src = null;
+                if (p.probe_bar) |b| self_.logBarGeometry(b);
+                return 0;
+            }
+        }.call, self);
     }
 
     /// Register a bar, pin it to the current view width, and mark the
@@ -1492,6 +1524,8 @@ pub const AiPanel = extern struct {
             );
             Self.pinWidgetWidth(w, wpx - 14);
         }
+        if (priv.bars.items.len > 0)
+            self.logBarGeometrySoon(priv.bars.items[priv.bars.items.len - 1]);
     }
 
     /// Newline before a block, unless the buffer already ends on one.
@@ -1525,9 +1559,8 @@ pub const AiPanel = extern struct {
             row.append(lbl.as(gtk.Widget));
         }
 
-        const sw = Self.wrapPill(row.as(gtk.Widget));
-        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
-        self.trackBar(sw.as(gtk.Widget), label);
+        priv.transcript.addChildAtAnchor(row.as(gtk.Widget), anchor);
+        self.trackBar(row.as(gtk.Widget), label);
     }
 
     /// Anchor a fresh rounded pill for the turn's answer text.
@@ -1544,9 +1577,8 @@ pub const AiPanel = extern struct {
         label.setWrap(1);
         label.setSelectable(1);
         label.as(gtk.Widget).addCssClass("ai-turn");
-        const sw = Self.wrapPill(label.as(gtk.Widget));
-        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
-        self.trackBar(sw.as(gtk.Widget), label);
+        priv.transcript.addChildAtAnchor(label.as(gtk.Widget), anchor);
+        self.trackBar(label.as(gtk.Widget), label);
         priv.ai_label = label;
     }
 
@@ -1644,9 +1676,8 @@ pub const AiPanel = extern struct {
         bar.setWrap(1);
         bar.setSelectable(1);
         bar.as(gtk.Widget).addCssClass(css_class);
-        const sw = Self.wrapPill(bar.as(gtk.Widget));
-        priv.transcript.addChildAtAnchor(sw.as(gtk.Widget), anchor);
-        self.trackBar(sw.as(gtk.Widget), bar);
+        priv.transcript.addChildAtAnchor(bar.as(gtk.Widget), anchor);
+        self.trackBar(bar.as(gtk.Widget), bar);
     }
 
     /// A standalone amber exec-status line.
