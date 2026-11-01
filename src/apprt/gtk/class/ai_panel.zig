@@ -131,11 +131,12 @@ pub const AiPanel = extern struct {
         turn_t0_ms: i64 = 0,
         turn_bytes: usize = 0,
 
-        /// Start of the in-flight AI turn's text range; the dark
-        /// background tag is repainted over [mark, end] as deltas
-        /// stream and fixed when the turn ends.
-        ai_turn_start: ?*gtk.TextMark = null,
-        tag_ai_bg: ?*gtk.TextTag = null,
+        /// The in-flight AI turn renders into a rounded child label
+        /// (same treatment as the user bar); its text is rewritten
+        /// with the accumulated answer on every delta, so streaming
+        /// stays visible inside the pill.
+        ai_label: ?*gtk.Label = null,
+        ai_stream: ?[:0]u8 = null,
 
         /// Text tags: user messages get a blue background; thinking
         /// bodies are italic/dim and additionally invisible when
@@ -462,17 +463,11 @@ pub const AiPanel = extern struct {
                 priv.ai_turn_open = true;
                 priv.turn_t0_ms = nowMs();
                 priv.turn_bytes = 0;
-                self.appendText("\n");
-                const buffer = priv.transcript.getBuffer();
-                if (priv.ai_turn_start) |m| buffer.deleteMark(m);
-                var mi: gtk.TextIter = undefined;
-                buffer.getEndIter(&mi);
-                priv.ai_turn_start = buffer.createMark(null, &mi, 1);
+                self.beginAiTurnLabel();
             }
             const txt: []const u8 = msg.text orelse "";
             priv.turn_bytes += txt.len;
-            self.appendSlice(txt);
-            self.applyAiBgTag();
+            self.appendToAiTurn(txt);
         } else if (std.mem.eql(u8, msg.type, "done")) {
             self.closeThinkingBlock();
             const priv = self.private();
@@ -1178,6 +1173,7 @@ pub const AiPanel = extern struct {
         priv.fd = -1;
         self.setDot("ai-dot-off");
         priv.ai_turn_open = false;
+        self.endAiTurn();
         priv.exec_active = false;
         priv.open_think = null;
         self.clearExecStrings();
@@ -1215,6 +1211,11 @@ pub const AiPanel = extern struct {
             \\label.ai-dot-ready { color: #4ec970; }
             \\label.ai-msg {
             \\    background: rgba(53,132,228,0.30);
+            \\    border-radius: 8px;
+            \\    padding: 2px 8px;
+            \\}
+            \\.ai-turn {
+            \\    background: rgba(0,0,0,0.28);
             \\    border-radius: 8px;
             \\    padding: 2px 8px;
             \\}
@@ -1296,16 +1297,6 @@ pub const AiPanel = extern struct {
             @as(c_int, 1),
             "foreground",
             "#9a9a9a",
-            @as(?[*:0]const u8, null),
-        );
-        priv.tag_ai_bg = buffer.createTag(
-            "ai_bg",
-            "background-set",
-            @as(c_int, 1),
-            "background",
-            "#000000",
-            "background-alpha",
-            @as(f64, 0.25),
             @as(?[*:0]const u8, null),
         );
         priv.tag_hidden = buffer.createTag(
@@ -1424,8 +1415,8 @@ pub const AiPanel = extern struct {
         ) catch null;
     }
 
-    /// User message bar: the blue pill wraps only the message text;
-    /// the arrival time sits beside it as a small dim caption.
+    /// User message bar: the blue pill, with the arrival time as a
+    /// small dim caption on the line below it.
     fn appendMsgBar(self: *Self, text: [:0]const u8, hm: ?[:0]const u8) void {
         const priv = self.private();
         const tbuf = priv.transcript.getBuffer();
@@ -1433,56 +1424,24 @@ pub const AiPanel = extern struct {
         tbuf.getEndIter(&it);
         const anchor = tbuf.createChildAnchor(&it);
 
-        const row = gtk.Box.new(.horizontal, 6);
+        const row = gtk.Box.new(.vertical, 0);
         const label = gtk.Label.new(text);
         label.setXalign(0);
         label.setWrap(1);
         label.setSelectable(1);
-        label.as(gtk.Widget).setHexpand(1);
         label.as(gtk.Widget).addCssClass("ai-msg");
         row.append(label.as(gtk.Widget));
 
-        var stamp_lbl: ?*gtk.Label = null;
         if (hm) |t| {
             const lbl = gtk.Label.new(t);
+            lbl.setXalign(1);
             lbl.as(gtk.Widget).addCssClass("caption");
             lbl.as(gtk.Widget).addCssClass("dim-label");
-            lbl.as(gtk.Widget).setValign(.end);
             row.append(lbl.as(gtk.Widget));
-            stamp_lbl = lbl;
         }
 
-        // A TextView allocates children their natural width, and a
-        // wrapping label's natural width is the full unwrapped text,
-        // which pushed the time caption off-screen. Pinning the
-        // label's width-request also caps its natural width, so the
-        // row stays inside the view and the caption stays visible.
         const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
         if (wpx > 60) {
-            var label_w: c_int = wpx - 14;
-            if (stamp_lbl) |lbl| {
-                var cap_min: c_int = 0;
-                var cap_nat: c_int = 0;
-                lbl.as(gtk.Widget).measure(
-                    .horizontal,
-                    -1,
-                    &cap_min,
-                    &cap_nat,
-                    null,
-                    null,
-                );
-                label_w -= 6 + cap_nat;
-            }
-            label_w = @max(label_w, 40);
-
-            var lw_value = gobject.ext.Value.newFrom(label_w);
-            defer lw_value.unset();
-            gobject.Object.setProperty(
-                label.as(gobject.Object),
-                "width-request",
-                &lw_value,
-            );
-
             var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
             defer wr_value.unset();
             gobject.Object.setProperty(
@@ -1490,55 +1449,86 @@ pub const AiPanel = extern struct {
                 "width-request",
                 &wr_value,
             );
+            var lw_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+            defer lw_value.unset();
+            gobject.Object.setProperty(
+                label.as(gobject.Object),
+                "width-request",
+                &lw_value,
+            );
         }
         priv.transcript.addChildAtAnchor(row.as(gtk.Widget), anchor);
     }
 
-    /// Small dim "· HH:MM" caption closing an AI turn. A child widget
-    /// rather than buffer text so it can carry a tooltip; the token
-    /// count is estimated at ~4 bytes per token because these
-    /// servers do not report usage on streamed responses.
-    /// Repaint the dark background over the streaming turn range.
-    fn applyAiBgTag(self: *Self) void {
+    /// Anchor a fresh rounded pill for the turn's answer text.
+    fn beginAiTurnLabel(self: *Self) void {
         const priv = self.private();
-        const start = priv.ai_turn_start orelse return;
-        const tag = priv.tag_ai_bg orelse return;
-        const buffer = priv.transcript.getBuffer();
-        var it_start: gtk.TextIter = undefined;
-        var it_end: gtk.TextIter = undefined;
-        buffer.getIterAtMark(&it_start, start);
-        buffer.getEndIter(&it_end);
-        buffer.applyTag(tag, &it_start, &it_end);
+        const tbuf = priv.transcript.getBuffer();
+        self.append("\n", null);
+        var it: gtk.TextIter = undefined;
+        tbuf.getEndIter(&it);
+        const anchor = tbuf.createChildAnchor(&it);
+
+        const label = gtk.Label.new("");
+        label.setXalign(0);
+        label.setWrap(1);
+        label.setSelectable(1);
+        label.as(gtk.Widget).addCssClass("ai-turn");
+        const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
+        if (wpx > 60) {
+            var wr_value = gobject.ext.Value.newFrom(@as(c_int, wpx - 14));
+            defer wr_value.unset();
+            gobject.Object.setProperty(
+                label.as(gobject.Object),
+                "width-request",
+                &wr_value,
+            );
+        }
+        priv.transcript.addChildAtAnchor(label.as(gtk.Widget), anchor);
+        priv.ai_label = label;
     }
 
-    /// Fix the background range when the turn ends (answer done, or
-    /// an exec proposal cutting the text short) and drop the mark.
+    /// Rewrite the pill with the accumulated answer. A few dozen KB
+    /// of re-set per turn is nothing next to the render it replaces.
+    fn appendToAiTurn(self: *Self, txt: []const u8) void {
+        const priv = self.private();
+        const a = alloc();
+        const label = priv.ai_label orelse return;
+        const prev: []const u8 = priv.ai_stream orelse "";
+        const next = std.fmt.allocPrintSentinel(
+            a,
+            "{s}{s}",
+            .{ prev, txt },
+            0,
+        ) catch return;
+        if (priv.ai_stream) |old| a.free(old);
+        priv.ai_stream = next;
+        label.setText(next.ptr);
+        // Child widgets do not trigger the buffer's insert-scroll,
+        // so keep the view pinned while the pill grows.
+        self.scrollSoon();
+    }
+
+    /// Turn text is final (answer done, or an exec proposal cutting
+    /// it short); drop the streaming references, keep the label.
     fn endAiTurn(self: *Self) void {
         const priv = self.private();
-        self.applyAiBgTag();
-        if (priv.ai_turn_start) |m| {
-            priv.transcript.getBuffer().deleteMark(m);
-            priv.ai_turn_start = null;
-        }
+        if (priv.ai_stream) |st| alloc().free(st);
+        priv.ai_stream = null;
+        priv.ai_label = null;
     }
 
     fn appendTurnCaption(self: *Self, hm: [:0]const u8) void {
         const priv = self.private();
         const a = alloc();
         const tbuf = priv.transcript.getBuffer();
+        self.append("\n", null);
         var it: gtk.TextIter = undefined;
         tbuf.getEndIter(&it);
         const anchor = tbuf.createChildAnchor(&it);
 
-        const text = std.fmt.allocPrintSentinel(
-            a,
-            " · {s}",
-            .{hm},
-            0,
-        ) catch return;
-        defer a.free(text);
-
-        const label = gtk.Label.new(text);
+        const label = gtk.Label.new(hm);
+        label.setXalign(0);
         label.as(gtk.Widget).addCssClass("caption");
         label.as(gtk.Widget).addCssClass("dim-label");
 
