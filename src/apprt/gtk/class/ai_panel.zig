@@ -159,8 +159,6 @@ pub const AiPanel = extern struct {
         /// lets resizes re-pin them (see syncBarWidths).
         bars: std.ArrayList(Bar) = .empty,
         bar_w: c_int = 0,
-        probe_bar: ?Bar = null,
-        probe_src: ?c_uint = null,
 
         /// Last character appended to the buffer (0 = empty, 'x' =
         /// a child widget followed). Guards block-leading newlines so
@@ -1243,6 +1241,15 @@ pub const AiPanel = extern struct {
             \\button.ai-thinking {
             \\    cursor: pointer;
             \\}
+            \\.ai-time {
+            \\    font-size: 0.75em;
+            \\}
+            \\button.ai-thinking {
+            \\    font-size: 0.75em;
+            \\    min-height: 0;
+            \\    min-width: 0;
+            \\    padding: 0 4px;
+            \\}
         ;
         const provider = gtk.CssProvider.new();
         provider.loadFromData(css.ptr, @intCast(css.len));
@@ -1450,9 +1457,6 @@ pub const AiPanel = extern struct {
         const wpx = priv.transcript.as(gtk.Widget).getAllocatedWidth();
         if (wpx <= 60 or wpx == priv.bar_w) return;
         priv.bar_w = wpx;
-        log.debug("bar-sync re-pin view={d} bars={d}", .{
-            wpx, priv.bars.items.len,
-        });
         for (priv.bars.items) |bar| {
             if (bar.l1) |lbl| Self.pinWidgetWidth(
                 lbl.as(gtk.Widget),
@@ -1460,53 +1464,6 @@ pub const AiPanel = extern struct {
             );
             Self.pinWidgetWidth(bar.w, wpx - 14);
         }
-    }
-
-    /// TEMP DEBUG: dump real size data once layout has settled.
-    fn logBarGeometry(self: *Self, bar: Private.Bar) void {
-        const priv = self.private();
-        const view = priv.transcript.as(gtk.Widget);
-        var bmin: c_int = 0;
-        var bnat: c_int = 0;
-        bar.w.measure(.horizontal, -1, &bmin, &bnat, null, null);
-        var amin: c_int = 0;
-        var anat: c_int = 0;
-        if (bar.l1) |lbl| lbl.as(gtk.Widget).measure(
-            .horizontal,
-            -1,
-            &amin,
-            &anat,
-            null,
-            null,
-        );
-        log.debug(
-            "bar-geo view_alloc={d} view_lmargin={d} bar_alloc={d} " ++
-                "bar_min={d} bar_nat={d} lbl_min={d} lbl_nat={d}",
-            .{
-                view.getAllocatedWidth(),
-                priv.transcript.getLeftMargin(),
-                bar.w.getAllocatedWidth(),
-                bmin,
-                bnat,
-                amin,
-                anat,
-            },
-        );
-    }
-
-    fn logBarGeometrySoon(self: *Self, bar: Private.Bar) void {
-        const priv = self.private();
-        priv.probe_bar = bar;
-        if (priv.probe_src) |id| _ = glib.Source.remove(id);
-        priv.probe_src = glib.timeoutAdd(400, struct {
-            fn call(ud: ?*anyopaque) callconv(.c) c_int {
-                const self_: *Self = @ptrCast(@alignCast(ud));
-                const p = self_.private();
-                p.probe_src = null;
-                if (p.probe_bar) |b| self_.logBarGeometry(b);
-                return 0;
-            }
-        }.call, self);
     }
 
     /// Register a bar, pin it to the current view width, and mark the
@@ -1524,8 +1481,6 @@ pub const AiPanel = extern struct {
             );
             Self.pinWidgetWidth(w, wpx - 14);
         }
-        if (priv.bars.items.len > 0)
-            self.logBarGeometrySoon(priv.bars.items[priv.bars.items.len - 1]);
     }
 
     /// Newline before a block, unless the buffer already ends on one.
@@ -1556,6 +1511,7 @@ pub const AiPanel = extern struct {
             lbl.setXalign(1);
             lbl.as(gtk.Widget).addCssClass("caption");
             lbl.as(gtk.Widget).addCssClass("dim-label");
+            lbl.as(gtk.Widget).addCssClass("ai-time");
             row.append(lbl.as(gtk.Widget));
         }
 
@@ -1639,7 +1595,7 @@ pub const AiPanel = extern struct {
         const anchor = tbuf.createChildAnchor(&it);
 
         const label = gtk.Label.new(hm);
-        label.as(gtk.Widget).addCssClass("ai-cap");
+        label.as(gtk.Widget).addCssClass("ai-time");
         label.setXalign(0);
         label.as(gtk.Widget).addCssClass("caption");
         label.as(gtk.Widget).addCssClass("dim-label");
