@@ -654,6 +654,7 @@ pub const AiPanel = extern struct {
 
         const button = gtk.Button.newWithLabel("thinking ▸");
         button.as(gtk.Widget).addCssClass("flat");
+        button.as(gtk.Widget).addCssClass("ai-thinking");
         button.as(gtk.Widget).addCssClass("caption");
         _ = gtk.Button.signals.clicked.connect(
             button,
@@ -1231,6 +1232,10 @@ pub const AiPanel = extern struct {
             \\    background: rgba(229,181,103,0.22);
             \\    border-radius: 8px;
             \\    padding: 4px 8px;
+            \\}
+            \\.ai-exec button,
+            \\button.ai-thinking {
+            \\    cursor: pointer;
             \\}
         ;
         const provider = gtk.CssProvider.new();
