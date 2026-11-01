@@ -1247,7 +1247,7 @@ pub const AiPanel = extern struct {
             \\    padding: 2px 8px;
             \\}
             \\.ai-exec {
-            \\    background: rgba(229,181,103,0.22);
+            \\    background: rgba(238,201,67,0.26);
             \\    border-radius: 8px;
             \\    padding: 4px 8px;
             \\}
