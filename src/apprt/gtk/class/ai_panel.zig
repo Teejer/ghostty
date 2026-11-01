@@ -1259,7 +1259,7 @@ pub const AiPanel = extern struct {
             \\    background: rgba(213,80,80,0.30);
             \\}
             \\.ai-time {
-            \\    font-size: 0.75em;
+            \\    font-size: 0.62em;
             \\}
             \\button.ai-thinking {
             \\    font-size: 0.75em;
