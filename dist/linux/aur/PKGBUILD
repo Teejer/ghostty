@@ -1,0 +1,53 @@
+# Maintainer: Teejer <teejer@users.noreply.github.com>
+pkgname=ghostty-ai
+pkgver=1.4.1.r758c4fb66
+pkgrel=1
+pkgdesc="Ghostty fork with a per-tab AI chat panel, plus its ghostty-ai daemon"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Teejer/ghostty"
+license=('MIT')
+depends=(
+  'bzip2' 'fontconfig' 'freetype2' 'glibc' 'glib2' 'gtk4'
+  'gtk4-layer-shell' 'libx11' 'harfbuzz' 'libadwaita' 'libpng'
+  'oniguruma' 'pixman' 'wayland' 'zlib' 'hicolor-icon-theme'
+  'ghostty-terminfo'
+)
+makedepends=('git' 'zig' 'blueprint-compiler' 'glslang' 'scdoc' 'go')
+optdepends=('ghostty-nautilus: Open in Ghostty context menu in GNOME Files')
+provides=('ghostty=1.4.1')
+conflicts=('ghostty')
+source=(
+  'ghostty::git+https://github.com/Teejer/ghostty.git#branch=ghostty-ai'
+  'ghostty-ai-daemon::git+https://github.com/Teejer/ghostty-ai.git'
+)
+sha256sums=('SKIP' 'SKIP')
+
+pkgver() {
+  cd ghostty
+  # 1.4.1-dev upstream -> 1.4.1.r<commits-on-branch>.<short-hash>
+  local base
+  base=$(grep -oP '(?<=\.version = ")[^"]+' build.zig.zon | sed 's/-dev$//')
+  printf '%s.r%s.%s\n' "$base" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd ghostty
+  zig build -Doptimize=ReleaseFast -Dstrip=true \
+    --prefix "$pkgdir/usr" install
+
+  cd "$srcdir/ghostty-ai-daemon"
+  export CGO_ENABLED=0
+  go build -trimpath -ldflags='-s -w' \
+    -o "$pkgdir/usr/bin/ghostty-ai" ./cmd/ghostty-ai
+}
+
+package() {
+  # The zig install step above already placed the terminal, .desktop file,
+  # icons, shell completions and man pages into $pkgdir. Here we add the
+  # daemon's example config and docs.
+  install -Dm644 "$srcdir/ghostty-ai-daemon/README.md" \
+    "$pkgdir/usr/share/doc/ghostty-ai/README.md"
+  install -Dm644 "$srcdir/ghostty-ai-daemon/config.example.json" \
+    "$pkgdir/etc/ghostty-ai/config.example.json"
+}
