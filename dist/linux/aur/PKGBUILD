@@ -16,6 +16,7 @@ makedepends=('git' 'zig' 'blueprint-compiler' 'glslang' 'scdoc' 'go')
 optdepends=('ghostty-nautilus: Open in Ghostty context menu in GNOME Files')
 provides=('ghostty=1.4.1')
 conflicts=('ghostty')
+backup=('etc/ghostty-ai/config.example.json')
 source=(
   'ghostty::git+https://github.com/Teejer/ghostty.git#branch=ghostty-ai'
   'ghostty-ai-daemon::git+https://github.com/Teejer/ghostty-ai.git'
@@ -33,19 +34,21 @@ pkgver() {
 
 build() {
   cd ghostty
-  zig build -Doptimize=ReleaseFast -Dstrip=true \
-    --prefix "$pkgdir/usr" install
+  zig build -Doptimize=ReleaseFast -Dstrip=true
 
   cd "$srcdir/ghostty-ai-daemon"
   export CGO_ENABLED=0
-  go build -trimpath -ldflags='-s -w' \
-    -o "$pkgdir/usr/bin/ghostty-ai" ./cmd/ghostty-ai
+  go build -trimpath -ldflags='-s -w' -o ghostty-ai ./cmd/ghostty-ai
 }
 
 package() {
-  # The zig install step above already placed the terminal, .desktop file,
-  # icons, shell completions and man pages into $pkgdir. Here we add the
-  # daemon's example config and docs.
+  # zig's cached install step; drops terminal, .desktop, icons,
+  # completions and man pages into the package.
+  cd "$srcdir/ghostty"
+  zig build install --prefix "$pkgdir/usr" -Doptimize=ReleaseFast -Dstrip=true
+
+  install -Dm755 "$srcdir/ghostty-ai-daemon/ghostty-ai" \
+    "$pkgdir/usr/bin/ghostty-ai"
   install -Dm644 "$srcdir/ghostty-ai-daemon/README.md" \
     "$pkgdir/usr/share/doc/ghostty-ai/README.md"
   install -Dm644 "$srcdir/ghostty-ai-daemon/config.example.json" \
